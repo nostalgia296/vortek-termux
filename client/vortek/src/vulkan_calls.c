@@ -15,7 +15,11 @@ struct VulkanFunc {
     void* func;
 };
 
+#define VORTEK_LOADER_ICD_INTERFACE_VERSION 5
+
 static void* findVkDispatchFuncWithName(const char* name);
+VkResult vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t* pSupportedVersion);
+PFN_vkVoidFunction vk_icdGetPhysicalDeviceProcAddr(VkInstance instance, const char* pName);
 
 static pthread_mutex_t vt_call_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -3477,6 +3481,8 @@ static const struct VulkanFunc vkDispatchTable[] = {
     {"vkGetShaderModuleCreateInfoIdentifierEXT", vt_call_vkGetShaderModuleCreateInfoIdentifierEXT},
     {"vkMapMemory2KHR", vt_call_vkMapMemory2KHR},
     {"vkUnmapMemory2KHR", vt_call_vkUnmapMemory2KHR},
+    {"vk_icdNegotiateLoaderICDInterfaceVersion", vk_icdNegotiateLoaderICDInterfaceVersion},
+    {"vk_icdGetPhysicalDeviceProcAddr", vk_icdGetPhysicalDeviceProcAddr},
 };
 
 static void* findVkDispatchFuncWithName(const char* name) {
@@ -3487,11 +3493,27 @@ static void* findVkDispatchFuncWithName(const char* name) {
 }
 
 PFN_vkVoidFunction vk_icdGetInstanceProcAddr(VkInstance instance, const char* pName) {
+    if (!pName) return NULL;
+
+    PFN_vkVoidFunction func = findVkDispatchFuncWithName(pName);
+    if (func == (PFN_vkVoidFunction)vk_icdNegotiateLoaderICDInterfaceVersion ||
+        func == (PFN_vkVoidFunction)vk_icdGetPhysicalDeviceProcAddr) {
+        return func;
+    }
+
+    if (!vortekInitOnce()) return NULL;
+    return func;
+}
+
+PFN_vkVoidFunction vk_icdGetPhysicalDeviceProcAddr(VkInstance instance, const char* pName) {
+    if (!pName) return NULL;
     if (!vortekInitOnce()) return NULL;
     return findVkDispatchFuncWithName(pName);
 }
 
 VkResult vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t* pSupportedVersion) {
-    *pSupportedVersion = 3;
+    if (*pSupportedVersion > VORTEK_LOADER_ICD_INTERFACE_VERSION) {
+        *pSupportedVersion = VORTEK_LOADER_ICD_INTERFACE_VERSION;
+    }
     return VK_SUCCESS;
 }

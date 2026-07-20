@@ -11,7 +11,7 @@
 
 #include "winlator.h"
 
-#ifdef __ANDROID__
+#if defined(__ANDROID__) && !defined(VT_CLIENT)
 #define VT_SERVER 1
 #define VK_NO_PROTOTYPES 1
 #endif

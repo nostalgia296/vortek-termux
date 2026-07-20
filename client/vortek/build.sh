@@ -1,15 +1,21 @@
 #!/bin/bash
-clear
+set -e
 
-export ROOTFS="/data/data/com.winlator/files/rootfs"
-export CFLAGS="-O2 -Wl,-rpath=$ROOTFS/lib"
+if [ -z "${ROOTFS:-}" ]; then
+    if [ -n "${PREFIX:-}" ] && [ -d "$PREFIX/glibc" ]; then
+        ROOTFS="$PREFIX/glibc"
+    else
+        ROOTFS="/data/data/com.termux/files/usr/glibc"
+    fi
+fi
 
-rm -r build
-mkdir build
-cd build
-cmake .. -DCMAKE_INSTALL_PREFIX=$ROOTFS/usr -DCMAKE_C_FLAGS_RELEASE="$CFLAGS" -DCMAKE_BUILD_TYPE=Release
-make -j8
+export ROOTFS
+export CFLAGS="${CFLAGS:-"-O2 -Wl,-rpath=$ROOTFS/lib"}"
 
-cd ..
+cmake -S . -B build -DCMAKE_INSTALL_PREFIX="$ROOTFS" -DCMAKE_C_FLAGS_RELEASE="$CFLAGS" -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j"${JOBS:-8}"
+cmake --install build
 
-bash create-asset.sh
+if [ -f create-asset.sh ]; then
+    bash create-asset.sh
+fi

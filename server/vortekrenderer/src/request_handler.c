@@ -197,9 +197,10 @@ void vt_handle_vkEnumerateInstanceExtensionProperties(VkContext* context) {
     result = vulkanWrapper.vkEnumerateInstanceExtensionProperties(NULL, &exposedExtensionCount, exposedExtensions);
 
     const char* extraExtensions[] = {"VK_KHR_surface", "VK_KHR_xlib_surface"};
+    int extraExtensionCount = XWindowSwapchain_hasWindowProvider(&context->jmethods) ? ARRAY_SIZE(extraExtensions) : 0;
     const char* skipExtensions[] = {"VK_KHR_android_surface"};
     injectExtensions2(context, &exposedExtensions, &exposedExtensionCount,
-                      extraExtensions, ARRAY_SIZE(extraExtensions),
+                      extraExtensions, extraExtensionCount,
                       skipExtensions, ARRAY_SIZE(skipExtensions));
 
     bool nullProperties = propertyCount == 0;

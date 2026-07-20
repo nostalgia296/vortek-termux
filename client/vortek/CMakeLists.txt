@@ -17,3 +17,7 @@ add_library(vulkan_vortek SHARED
             src/arrays.c
             src/descriptor_update_template.c
             src/ring_buffer.c)
+target_compile_definitions(vulkan_vortek PRIVATE VT_CLIENT)
+
+install(TARGETS vulkan_vortek LIBRARY DESTINATION lib)
+install(FILES vortek_icd.aarch64.json DESTINATION share/vulkan/icd.d)
