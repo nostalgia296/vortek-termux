@@ -2011,7 +2011,11 @@ void vt_handle_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkContext* context) {
 
     VkSurfaceCapabilitiesKHR surfaceCapabilities = {0};
     surfaceCapabilities.minImageCount = getSurfaceMinImageCount();
+#ifdef VORTEK_CLI_X11
+    surfaceCapabilities.maxImageCount = 3;
+#else
     surfaceCapabilities.maxImageCount = surfaceCapabilities.minImageCount == 1 ? 2 : 0;
+#endif
     surfaceCapabilities.currentExtent = windowSize;
     surfaceCapabilities.minImageExtent = windowSize;
     surfaceCapabilities.maxImageExtent = windowSize;

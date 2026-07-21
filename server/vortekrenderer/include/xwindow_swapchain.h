@@ -9,6 +9,7 @@ typedef struct XWindowSwapchain_Image {
     VkImage image;
     VkDeviceMemory memory;
 #ifdef VORTEK_CLI_X11
+    bool acquired;
     VkCommandBuffer commandBuffer;
     VkFence presentFence;
     VkBuffer readbackBuffer;
@@ -30,6 +31,7 @@ typedef struct XWindowSwapchain {
 #ifdef VORTEK_CLI_X11
     VkDevice device;
     VkCommandPool commandPool;
+    uint32_t nextImageIndex;
     void* x11Display;
     void* x11Image;
     void* x11GC;

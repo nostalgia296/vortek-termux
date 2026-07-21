@@ -470,7 +470,11 @@ static VkResult createCliCommandResources(VkDevice device, uint32_t graphicsQueu
 #endif
 
 int getSurfaceMinImageCount() {
+#ifdef VORTEK_CLI_X11
+    return 2;
+#else
     return 1;
+#endif
 }
 
 VkSurfaceFormatKHR* getSurfaceFormats(uint32_t* formatCount) {
@@ -490,9 +494,22 @@ VkSurfaceFormatKHR* getSurfaceFormats(uint32_t* formatCount) {
 
 XWindowSwapchain* XWindowSwapchain_create(VkDevice device, uint32_t graphicsQueueIndex, VkSwapchainCreateInfoKHR* swapchainInfo, JMethods* jmethods, uint64_t windowId) {
     XWindowSwapchain* swapchain = calloc(1, sizeof(XWindowSwapchain));
+    if (!swapchain) return NULL;
+
+#ifdef VORTEK_CLI_X11
+    bool useX11Backend = !XWindowSwapchain_hasWindowProvider(jmethods);
+#endif
+
     swapchain->windowId = windowId;
     swapchain->imageCount = swapchainInfo->minImageCount;
+    if (swapchain->imageCount <= 0) swapchain->imageCount = getSurfaceMinImageCount();
+#ifdef VORTEK_CLI_X11
+    if (useX11Backend && swapchain->imageCount < getSurfaceMinImageCount()) {
+        swapchain->imageCount = getSurfaceMinImageCount();
+    }
+#endif
     swapchain->images = calloc(swapchain->imageCount, sizeof(XWindowSwapchain_Image));
+    if (!swapchain->images) goto error;
     swapchain->imageFormat = swapchainInfo->imageFormat;
     swapchain->imageUsage = swapchainInfo->imageUsage;
     memcpy(&swapchain->imageExtent, &swapchainInfo->imageExtent, sizeof(VkExtent2D));
@@ -503,7 +520,6 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, uint32_t graphicsQueu
 
     VkResult result;
 #ifdef VORTEK_CLI_X11
-    bool useX11Backend = !XWindowSwapchain_hasWindowProvider(jmethods);
     if (useX11Backend) {
         if (!createX11Image(swapchain)) goto error;
 
@@ -557,6 +573,47 @@ void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain) {
 }
 
 VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t timeout, VkSemaphore signalSemaphore, VkFence fence, uint32_t* imageIndex) {
+#ifdef VORTEK_CLI_X11
+    if (!swapchain) return VK_ERROR_SURFACE_LOST_KHR;
+    if (!imageIndex) return VK_ERROR_INITIALIZATION_FAILED;
+
+    if (!XWindowSwapchain_hasWindowProvider(swapchain->jmethods)) {
+        VkExtent2D windowSize;
+        if (!XWindowSwapchain_getWindowExtent(swapchain->jmethods, swapchain->windowId, &windowSize)) {
+            return VK_ERROR_SURFACE_LOST_KHR;
+        }
+
+        if (swapchain->imageExtent.width != windowSize.width || swapchain->imageExtent.height != windowSize.height) {
+            return VK_ERROR_SURFACE_LOST_KHR;
+        }
+
+        for (int i = 0; i < swapchain->imageCount; i++) {
+            uint32_t candidate = (swapchain->nextImageIndex + (uint32_t)i) % (uint32_t)swapchain->imageCount;
+            if (swapchain->images[candidate].acquired) continue;
+
+            if (signalSemaphore || fence) {
+                VkSubmitInfo submitInfo = {0};
+                submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                if (signalSemaphore) {
+                    submitInfo.pSignalSemaphores = &signalSemaphore;
+                    submitInfo.signalSemaphoreCount = 1;
+                }
+
+                VkResult submitResult = vulkanWrapper.vkQueueSubmit(swapchain->queue, 1, &submitInfo, fence);
+                if (submitResult == VK_ERROR_DEVICE_LOST) return submitResult;
+                if (submitResult != VK_SUCCESS) return submitResult;
+            }
+
+            swapchain->images[candidate].acquired = true;
+            swapchain->nextImageIndex = (candidate + 1) % (uint32_t)swapchain->imageCount;
+            *imageIndex = candidate;
+            return VK_SUCCESS;
+        }
+
+        return timeout == 0 ? VK_NOT_READY : VK_TIMEOUT;
+    }
+#endif
+
     if (signalSemaphore || fence) {
         VkSubmitInfo submitInfo = {0};
         submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -847,6 +904,11 @@ static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex
 
     return uploadReadbackToX11(swapchain, swapchainImage) ? VK_SUCCESS : VK_ERROR_SURFACE_LOST_KHR;
 }
+
+static void releaseCliImage(XWindowSwapchain* swapchain, uint32_t imageIndex) {
+    if (!swapchain || imageIndex >= (uint32_t)swapchain->imageCount) return;
+    swapchain->images[imageIndex].acquired = false;
+}
 #endif
 
 #ifdef VORTEK_CLI_X11
@@ -855,7 +917,9 @@ VkResult XWindowSwapchain_presentImageWithWaits(XWindowSwapchain* swapchain, uin
     if (!swapchain) return VK_ERROR_SURFACE_LOST_KHR;
     if (waitSemaphoreCount > 0 && !waitSemaphores) return VK_ERROR_INITIALIZATION_FAILED;
     if (XWindowSwapchain_hasWindowProvider(swapchain->jmethods)) return VK_ERROR_INITIALIZATION_FAILED;
-    return presentX11Image(swapchain, imageIndex, waitSemaphoreCount, waitSemaphores);
+    VkResult result = presentX11Image(swapchain, imageIndex, waitSemaphoreCount, waitSemaphores);
+    releaseCliImage(swapchain, imageIndex);
+    return result;
 }
 #endif
 
@@ -864,7 +928,9 @@ VkResult XWindowSwapchain_presentImage(XWindowSwapchain* swapchain, uint32_t ima
 
     if (!XWindowSwapchain_hasWindowProvider(swapchain->jmethods)) {
 #ifdef VORTEK_CLI_X11
-        return presentX11Image(swapchain, imageIndex, 0, NULL);
+        VkResult result = presentX11Image(swapchain, imageIndex, 0, NULL);
+        releaseCliImage(swapchain, imageIndex);
+        return result;
 #else
         return VK_ERROR_SURFACE_LOST_KHR;
 #endif

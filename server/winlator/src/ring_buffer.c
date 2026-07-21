@@ -6,7 +6,11 @@
 #include <string.h>
 #include <stddef.h>
 #include <pthread.h>
+#include <errno.h>
+#include <limits.h>
+#include <linux/futex.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 
 #include "ring_buffer.h"
 #include "time_utils.h"
@@ -14,11 +18,40 @@
 
 #define STRUCT_OFFSETS() \
     struct Offsets { \
-        uint32_t head; \
-        uint32_t tail; \
-        uint32_t status; \
-        void* buffer; \
+        atomic_uint head; \
+        atomic_uint tail; \
+        atomic_uint status; \
+        atomic_uint readSignal; \
+        atomic_uint writeSignal; \
+        uint8_t buffer; \
     }
+
+static int futexWait(atomic_uint* address, uint32_t expected) {
+    return syscall(SYS_futex, (uint32_t*)address, FUTEX_WAIT, expected, NULL, NULL, 0);
+}
+
+static void futexWakeAll(atomic_uint* address) {
+    syscall(SYS_futex, (uint32_t*)address, FUTEX_WAKE, INT_MAX, NULL, NULL, 0);
+}
+
+static void RingBuffer_signalRead(RingBuffer* ring) {
+    if (!ring || !ring->readSignal) return;
+    atomic_fetch_add_explicit(ring->readSignal, 1, memory_order_release);
+    futexWakeAll(ring->readSignal);
+}
+
+static void RingBuffer_signalWrite(RingBuffer* ring) {
+    if (!ring || !ring->writeSignal) return;
+    atomic_fetch_add_explicit(ring->writeSignal, 1, memory_order_release);
+    futexWakeAll(ring->writeSignal);
+}
+
+static void RingBuffer_waitOn(atomic_uint* signal, uint32_t expected) {
+    if (futexWait(signal, expected) < 0 && errno != EAGAIN && errno != EINTR) {
+        uint32_t busyWaitIter = BUSY_WAIT_MAX_ITER;
+        busyWait(&busyWaitIter);
+    }
+}
 
 #ifdef __ANDROID__
 #include <android/log.h>
@@ -29,6 +62,7 @@
 
 void RingBuffer_setHead(RingBuffer* ring, uint32_t head) {
     atomic_store_explicit(ring->head, head, memory_order_release);
+    RingBuffer_signalWrite(ring);
 }
 
 uint32_t RingBuffer_getHead(RingBuffer* ring) {
@@ -36,7 +70,8 @@ uint32_t RingBuffer_getHead(RingBuffer* ring) {
 }
 
 void RingBuffer_setTail(RingBuffer* ring, uint32_t tail) {
-    return atomic_store_explicit(ring->tail, tail, memory_order_release);
+    atomic_store_explicit(ring->tail, tail, memory_order_release);
+    RingBuffer_signalRead(ring);
 }
 
 uint32_t RingBuffer_getTail(RingBuffer* ring) {
@@ -45,6 +80,10 @@ uint32_t RingBuffer_getTail(RingBuffer* ring) {
 
 void RingBuffer_setStatus(RingBuffer* ring, uint32_t status) {
     atomic_fetch_or_explicit(ring->status, status, memory_order_seq_cst);
+    if (status & RING_STATUS_EXIT) {
+        RingBuffer_signalRead(ring);
+        RingBuffer_signalWrite(ring);
+    }
 }
 
 void RingBuffer_unsetStatus(RingBuffer* ring, uint32_t status) {
@@ -57,18 +96,25 @@ bool RingBuffer_hasStatus(RingBuffer* ring, uint32_t status) {
 
 RingBuffer* RingBuffer_create(int shmFd, uint32_t bufferSize) {
     RingBuffer* ring = calloc(1, sizeof(RingBuffer));
+    if (!ring) return NULL;
 
     STRUCT_OFFSETS();
 
     int shmSize = RingBuffer_getSHMemSize(bufferSize);
     void* sharedData = mmap(NULL, shmSize, PROT_READ | PROT_WRITE, MAP_SHARED, shmFd, 0);
-    if (sharedData == MAP_FAILED) return NULL;
+    if (sharedData == MAP_FAILED) {
+        free(ring);
+        return NULL;
+    }
     memset(sharedData, 0, shmSize);
 
-    ring->head = sharedData + offsetof(struct Offsets, head);
-    ring->tail = sharedData + offsetof(struct Offsets, tail);
-    ring->status = sharedData + offsetof(struct Offsets, status);
-    ring->buffer = sharedData + offsetof(struct Offsets, buffer);
+    ring->head = (atomic_uint*)((uint8_t*)sharedData + offsetof(struct Offsets, head));
+    ring->tail = (atomic_uint*)((uint8_t*)sharedData + offsetof(struct Offsets, tail));
+    ring->status = (atomic_uint*)((uint8_t*)sharedData + offsetof(struct Offsets, status));
+    ring->readSignal = (atomic_uint*)((uint8_t*)sharedData + offsetof(struct Offsets, readSignal));
+    ring->writeSignal = (atomic_uint*)((uint8_t*)sharedData + offsetof(struct Offsets, writeSignal));
+    ring->buffer = (uint8_t*)sharedData + offsetof(struct Offsets, buffer);
+    ring->sharedData = sharedData;
     ring->bufferSize = bufferSize;
 
     RingBuffer_setStatus(ring, RING_STATUS_IDLE);
@@ -148,22 +194,26 @@ void RingBuffer_free(RingBuffer* ring) {
 }
 
 bool RingBuffer_waitForRead(RingBuffer* ring, uint32_t size) {
-    uint32_t busyWaitIter = 0;
     do {
         if (RingBuffer_size(ring) >= size) break;
-        busyWait(&busyWaitIter);
         if (RingBuffer_hasStatus(ring, RING_STATUS_EXIT)) return false;
+        uint32_t signal = atomic_load_explicit(ring->readSignal, memory_order_acquire);
+        if (RingBuffer_size(ring) >= size) break;
+        if (RingBuffer_hasStatus(ring, RING_STATUS_EXIT)) return false;
+        RingBuffer_waitOn(ring->readSignal, signal);
     }
     while (1);
     return true;
 }
 
 bool RingBuffer_waitForWrite(RingBuffer* ring, uint32_t size) {
-    uint32_t busyWaitIter = 0;
     do {
         if (RingBuffer_freeSpace(ring) >= size) break;
-        busyWait(&busyWaitIter);
         if (RingBuffer_hasStatus(ring, RING_STATUS_EXIT)) return false;
+        uint32_t signal = atomic_load_explicit(ring->writeSignal, memory_order_acquire);
+        if (RingBuffer_freeSpace(ring) >= size) break;
+        if (RingBuffer_hasStatus(ring, RING_STATUS_EXIT)) return false;
+        RingBuffer_waitOn(ring->writeSignal, signal);
     }
     while (1);
     return true;

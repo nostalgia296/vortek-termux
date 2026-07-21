@@ -10,6 +10,8 @@ typedef struct RingBuffer {
     atomic_uint* head;
     atomic_uint* tail;
     atomic_uint* status;
+    atomic_uint* readSignal;
+    atomic_uint* writeSignal;
     void* buffer;
     void* sharedData;
     uint32_t bufferSize;
