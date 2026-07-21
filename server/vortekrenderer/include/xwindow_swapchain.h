@@ -31,6 +31,7 @@ typedef struct XWindowSwapchain {
     VkCommandBuffer commandBuffer;
     void* x11Display;
     void* x11Image;
+    void* x11GC;
     char* x11ImageData;
     int x11Screen;
     unsigned long x11Window;
@@ -50,6 +51,7 @@ extern VkSurfaceFormatKHR* getSurfaceFormats(uint32_t* formatCount);
 extern XWindowSwapchain* XWindowSwapchain_create(VkDevice device, uint32_t graphicsQueueIndex, VkSwapchainCreateInfoKHR* swapchainInfo, JMethods* jmethods, uint64_t windowId);
 extern void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain);
 extern VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t timeout, VkSemaphore signalSemaphore, VkFence fence, uint32_t* imageIndex);
+extern VkResult XWindowSwapchain_waitForPresent(XWindowSwapchain* swapchain, uint32_t waitSemaphoreCount, const VkSemaphore* waitSemaphores);
 extern VkResult XWindowSwapchain_presentImage(XWindowSwapchain* swapchain, uint32_t imageIndex);
 
 #endif

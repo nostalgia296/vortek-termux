@@ -552,19 +552,65 @@ void vt_handle_vkWaitForFences(VkContext* context) {
 
     if (timeout != 0) {
         VkResult result = VK_SUCCESS;
-        int fds[fenceCount];
+        int fds[MAX_FDS];
+        bool pending[fenceCount];
+        int fdCount = 0;
+        bool waitSatisfied = waitAll == VK_TRUE;
+
         for (int i = 0; i < fenceCount; i++) {
+            VkResult status = vulkanWrapper.vkGetFenceStatus(device, fences[i]);
+            pending[i] = status == VK_NOT_READY;
+            if (status == VK_SUCCESS) {
+                if (!waitAll) waitSatisfied = true;
+            }
+            else if (status == VK_NOT_READY) {
+                if (waitAll) waitSatisfied = false;
+            }
+            else {
+                result = status;
+                break;
+            }
+        }
+
+        if (result == VK_SUCCESS && !waitSatisfied && fenceCount > MAX_FDS) {
+            result = vulkanWrapper.vkWaitForFences(device, fenceCount, fences, waitAll, timeout);
+            waitSatisfied = result == VK_SUCCESS;
+        }
+
+        for (int i = 0; result == VK_SUCCESS && !waitSatisfied && i < fenceCount; i++) {
+            if (!pending[i]) continue;
             VkFenceGetFdInfoKHR getFdInfo = {0};
             getFdInfo.sType = VK_STRUCTURE_TYPE_FENCE_GET_FD_INFO_KHR;
             getFdInfo.fence = fences[i];
             getFdInfo.handleType = VK_EXTERNAL_FENCE_HANDLE_TYPE_SYNC_FD_BIT;
 
-            result = vulkanWrapper.vkGetFenceFd(device, &getFdInfo, &fds[i]);
+            int fd = -1;
+            result = vulkanWrapper.vkGetFenceFd(device, &getFdInfo, &fd);
+            if (result == VK_NOT_READY && vulkanWrapper.vkGetFenceStatus(device, fences[i]) == VK_SUCCESS) {
+                result = VK_SUCCESS;
+            }
             if (result != VK_SUCCESS) break;
+            if (fd >= 0) {
+                fds[fdCount++] = fd;
+            }
+            else if (!waitAll) {
+                waitSatisfied = true;
+            }
         }
 
-        send_fds(context->clientFd, fds, fenceCount, &result, sizeof(VkResult));
-        for (int i = 0; i < fenceCount; i++) CLOSEFD(fds[i]);
+        if (result == VK_SUCCESS && waitSatisfied) {
+            for (int i = 0; i < fdCount; i++) CLOSEFD(fds[i]);
+            fdCount = 0;
+            result = VK_SUCCESS;
+        }
+
+        if (result == VK_SUCCESS && fdCount > 0) {
+            send_fds(context->clientFd, fds, fdCount, &result, sizeof(VkResult));
+        }
+        else {
+            send(context->clientFd, &result, sizeof(VkResult), 0);
+        }
+        for (int i = 0; i < fdCount; i++) CLOSEFD(fds[i]);
     }
     else {
         VkResult result = vulkanWrapper.vkWaitForFences(device, fenceCount, fences, waitAll, timeout);
@@ -2144,9 +2190,23 @@ void vt_handle_vkQueuePresentKHR(VkContext* context) {
     vt_unserialize_VkPresentInfoKHR(&presentInfo, context->inputBuffer, &context->memoryPool);
 
     VkResult result = VK_SUCCESS;
+    XWindowSwapchain* waitSwapchain = NULL;
+    for (uint32_t i = 0; i < presentInfo.swapchainCount; i++) {
+        if (presentInfo.pSwapchains[i]) {
+            waitSwapchain = (XWindowSwapchain*)presentInfo.pSwapchains[i];
+            break;
+        }
+    }
+
+    if (presentInfo.waitSemaphoreCount > 0) {
+        result = XWindowSwapchain_waitForPresent(waitSwapchain, presentInfo.waitSemaphoreCount, presentInfo.pWaitSemaphores);
+    }
+
     for (int i = 0; i < presentInfo.swapchainCount; i++) {
         uint32_t imageIndex = presentInfo.pImageIndices ? presentInfo.pImageIndices[i] : 0;
-        VkResult presentResult = XWindowSwapchain_presentImage((XWindowSwapchain*)presentInfo.pSwapchains[i], imageIndex);
+        VkResult presentResult = result == VK_SUCCESS ?
+                                 XWindowSwapchain_presentImage((XWindowSwapchain*)presentInfo.pSwapchains[i], imageIndex) :
+                                 result;
         if (presentInfo.pResults) presentInfo.pResults[i] = presentResult;
         if (result == VK_SUCCESS && presentResult != VK_SUCCESS) result = presentResult;
     }

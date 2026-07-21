@@ -123,8 +123,17 @@ static bool createX11Image(XWindowSwapchain* swapchain) {
         return false;
     }
 
+    beginX11ErrorTrap(display);
+    GC gc = XCreateGC(display, (Window)swapchain->windowId, 0, NULL);
+    bool gcSuccess = endX11ErrorTrap(display);
+    if (!gcSuccess || !gc) {
+        XDestroyImage(image);
+        return false;
+    }
+
     swapchain->x11Display = display;
     swapchain->x11Image = image;
+    swapchain->x11GC = gc;
     swapchain->x11ImageData = data;
     swapchain->x11Screen = screen;
     swapchain->x11Window = (Window)swapchain->windowId;
@@ -444,6 +453,7 @@ void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain) {
 
 #ifdef VORTEK_CLI_X11
     if (swapchain->commandPool) vulkanWrapper.vkDestroyCommandPool(device, swapchain->commandPool, NULL);
+    if (swapchain->x11GC) XFreeGC((Display*)swapchain->x11Display, (GC)swapchain->x11GC);
     if (swapchain->x11Image) XDestroyImage((XImage*)swapchain->x11Image);
 #endif
 
@@ -478,6 +488,31 @@ VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t
     return result;
 }
 
+VkResult XWindowSwapchain_waitForPresent(XWindowSwapchain* swapchain, uint32_t waitSemaphoreCount, const VkSemaphore* waitSemaphores) {
+    if (!swapchain) return VK_ERROR_SURFACE_LOST_KHR;
+    if (waitSemaphoreCount == 0) return VK_SUCCESS;
+    if (!waitSemaphores) return VK_ERROR_INITIALIZATION_FAILED;
+
+    VkPipelineStageFlags* waitStages = calloc(waitSemaphoreCount, sizeof(VkPipelineStageFlags));
+    if (!waitStages) return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    for (uint32_t i = 0; i < waitSemaphoreCount; i++) {
+        waitStages[i] = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+    }
+
+    VkSubmitInfo submitInfo = {0};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = waitSemaphoreCount;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = waitStages;
+
+    VkResult result = vulkanWrapper.vkQueueSubmit(swapchain->queue, 1, &submitInfo, VK_NULL_HANDLE);
+    free(waitStages);
+    if (result != VK_SUCCESS) return result;
+
+    return vulkanWrapper.vkQueueWaitIdle(swapchain->queue);
+}
+
 #ifdef VORTEK_CLI_X11
 static bool uploadReadbackToX11(XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage) {
     XImage* ximage = (XImage*)swapchain->x11Image;
@@ -508,7 +543,7 @@ static bool uploadReadbackToX11(XWindowSwapchain* swapchain, XWindowSwapchain_Im
 
     Display* display = (Display*)swapchain->x11Display;
     beginX11ErrorTrap(display);
-    XPutImage(display, (Window)swapchain->x11Window, DefaultGC(display, swapchain->x11Screen),
+    XPutImage(display, (Window)swapchain->x11Window, (GC)swapchain->x11GC,
               ximage, 0, 0, 0, 0, width, height);
     XFlush(display);
     return endX11ErrorTrap(display);

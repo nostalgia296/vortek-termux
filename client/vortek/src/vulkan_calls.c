@@ -1,5 +1,6 @@
 #include <sys/mman.h>
 #include <pthread.h>
+#include <limits.h>
 
 #include "vortek.h"
 #include "vortek_serializer.h"
@@ -603,12 +604,26 @@ VkResult vt_call_vkWaitForFences(VkDevice device, uint32_t fenceCount, const VkF
     }
     else {
         int fds[fenceCount];
-        int result, numFds;
-        recv_fds(serverFd, fds, &numFds, &result, sizeof(VkResult));
+        int result = VK_ERROR_DEVICE_LOST;
+        int numFds = 0;
+        int bytesRead = recv_fds(serverFd, fds, &numFds, &result, sizeof(VkResult));
         VT_CALL_UNLOCK();
-        
-        if (numFds == 0 || result != VK_SUCCESS) return VK_ERROR_DEVICE_LOST;
-        int timeoutMs = timeout != UINT64_MAX ? timeout / 1000000 : 0;
+
+        if (bytesRead != sizeof(VkResult)) {
+            for (int i = 0; i < numFds; i++) CLOSEFD(fds[i]);
+            return VK_ERROR_DEVICE_LOST;
+        }
+        if (result != VK_SUCCESS) {
+            for (int i = 0; i < numFds; i++) CLOSEFD(fds[i]);
+            return (VkResult)result;
+        }
+        if (numFds == 0) return VK_SUCCESS;
+
+        int timeoutMs = -1;
+        if (timeout != UINT64_MAX) {
+            uint64_t roundedMs = timeout / 1000000 + (timeout % 1000000 != 0);
+            timeoutMs = roundedMs > INT_MAX ? INT_MAX : (int)roundedMs;
+        }
         result = waitForEvents(fds, numFds, waitAll ? true : false, timeoutMs);
         for (int i = 0; i < numFds; i++) CLOSEFD(fds[i]);
         return result == EVENT_RESULT_TIMEOUT ? VK_TIMEOUT : (result == EVENT_RESULT_SUCCESS ? VK_SUCCESS : VK_ERROR_DEVICE_LOST);
