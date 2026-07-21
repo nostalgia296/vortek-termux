@@ -4,6 +4,7 @@ project(VortekRenderer)
 
 option(VORTEK_BUILD_JNI "Build the Android JNI shared library" ON)
 option(VORTEK_BUILD_CLI "Build the standalone Termux CLI service" OFF)
+option(VORTEK_CLI_X11 "Enable X11 readback presentation backend for the CLI service" ON)
 
 set(WINLATOR_INCLUDE_DIR "../winlator/include" CACHE PATH "Path to Winlator public headers")
 set(WINLATOR_SOURCE_DIR "../winlator" CACHE PATH "Path to Winlator source tree")
@@ -81,4 +82,12 @@ if(VORTEK_BUILD_CLI)
                           log
                           android
                           dl)
+    if(VORTEK_CLI_X11)
+        find_package(PkgConfig REQUIRED)
+        pkg_check_modules(X11 REQUIRED x11)
+        target_compile_definitions(vortekrenderer-cli PRIVATE VORTEK_CLI_X11)
+        target_include_directories(vortekrenderer-cli PRIVATE ${X11_INCLUDE_DIRS})
+        target_link_directories(vortekrenderer-cli PRIVATE ${X11_LIBRARY_DIRS})
+        target_link_libraries(vortekrenderer-cli ${X11_LIBRARIES})
+    endif()
 endif()

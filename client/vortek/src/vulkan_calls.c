@@ -1769,7 +1769,8 @@ void vt_call_vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface, cons
 }
 
 VkResult vt_call_vkGetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex, VkSurfaceKHR surface, VkBool32* pSupported) {
-    *pSupported = VK_TRUE;
+    VkObject* surfaceObject = VkObject_fromHandle(surface);
+    *pSupported = !VKOBJECT_IS_NULL(surfaceObject) ? VK_TRUE : VK_FALSE;
     return VK_SUCCESS;
 }
 
@@ -1791,8 +1792,9 @@ VkResult vt_call_vkGetPhysicalDeviceSurfaceFormatsKHR(VkPhysicalDevice physicalD
     VT_CALL_LOCK();
     if (!pSurfaceFormats) *pSurfaceFormatCount = 0;
     VkObject* physicalDeviceObject = VkObject_fromHandle(physicalDevice);
+    VkObject* surfaceObject = VkObject_fromHandle(surface);
 
-    VT_SERIALIZE_CMD(vkGetPhysicalDeviceSurfaceFormatsKHR, (VkPhysicalDevice)&physicalDeviceObject->id, NULL, pSurfaceFormatCount, NULL);
+    VT_SERIALIZE_CMD(vkGetPhysicalDeviceSurfaceFormatsKHR, (VkPhysicalDevice)&physicalDeviceObject->id, (VkSurfaceKHR)&surfaceObject->id, pSurfaceFormatCount, NULL);
     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_SURFACE_FORMATS_KHR, VT_RETURN);
     VT_RECV_CHECKED(VT_RETURN);
 
@@ -1805,8 +1807,9 @@ VkResult vt_call_vkGetPhysicalDeviceSurfacePresentModesKHR(VkPhysicalDevice phys
     VT_CALL_LOCK();
     if (!pPresentModes) *pPresentModeCount = 0;
     VkObject* physicalDeviceObject = VkObject_fromHandle(physicalDevice);
+    VkObject* surfaceObject = VkObject_fromHandle(surface);
 
-    VT_SERIALIZE_CMD(vkGetPhysicalDeviceSurfacePresentModesKHR, (VkPhysicalDevice)&physicalDeviceObject->id, NULL, pPresentModeCount, NULL);
+    VT_SERIALIZE_CMD(vkGetPhysicalDeviceSurfacePresentModesKHR, (VkPhysicalDevice)&physicalDeviceObject->id, (VkSurfaceKHR)&surfaceObject->id, pPresentModeCount, NULL);
     VT_SEND_CHECKED(REQUEST_CODE_VK_GET_PHYSICAL_DEVICE_SURFACE_PRESENT_MODES_KHR, VT_RETURN);
     VT_RECV_CHECKED(VT_RETURN);
 
@@ -1889,25 +1892,44 @@ VkResult vt_call_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPrese
     
     VT_SERIALIZE_CMD(VkPresentInfoKHR, pPresentInfo);
     VT_SEND_CHECKED(REQUEST_CODE_VK_QUEUE_PRESENT_KHR, VT_RETURN);
-    
+    VT_RECV_CHECKED(VT_RETURN);
+
     if (pPresentInfo->pResults) {
         for (int i = 0; i < pPresentInfo->swapchainCount; i++) {
-            pPresentInfo->pResults[i] = VK_SUCCESS;
+            pPresentInfo->pResults[i] = result;
         }
     }
     
     VT_CALL_UNLOCK();
-    return VK_SUCCESS;
+    return (VkResult)result;
 }
 
 VkResult vt_call_vkCreateXlibSurfaceKHR(VkInstance instance, const VkXlibSurfaceCreateInfoKHR* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSurfaceKHR* pSurface) {
+    if (!pCreateInfo || !pCreateInfo->dpy || pCreateInfo->window == 0 || !pSurface) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    VkObject* surfaceObject = VkObject_create(VK_OBJECT_TYPE_SURFACE_KHR, (uint64_t)pCreateInfo->window);
+    *pSurface = VkObject_toHandle(surfaceObject);
+    return VK_SUCCESS;
+}
+
+VkResult vt_call_vkCreateXcbSurfaceKHR(VkInstance instance, const VkXcbSurfaceCreateInfoKHR* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkSurfaceKHR* pSurface) {
+    if (!pCreateInfo || !pCreateInfo->connection || pCreateInfo->window == 0 || !pSurface) {
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
     VkObject* surfaceObject = VkObject_create(VK_OBJECT_TYPE_SURFACE_KHR, (uint64_t)pCreateInfo->window);
     *pSurface = VkObject_toHandle(surfaceObject);
     return VK_SUCCESS;
 }
 
 VkBool32 vt_call_vkGetPhysicalDeviceXlibPresentationSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex, Display* dpy, VisualID visualID) {
-    return VK_TRUE;
+    return dpy && visualID ? VK_TRUE : VK_FALSE;
+}
+
+VkBool32 vt_call_vkGetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice physicalDevice, uint32_t queueFamilyIndex, xcb_connection_t* connection, xcb_visualid_t visual_id) {
+    return connection && visual_id ? VK_TRUE : VK_FALSE;
 }
 
 void vt_call_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceFeatures2* pFeatures) {
@@ -3306,7 +3328,9 @@ static const struct VulkanFunc vkDispatchTable[] = {
     {"vkAcquireNextImageKHR", vt_call_vkAcquireNextImageKHR},
     {"vkQueuePresentKHR", vt_call_vkQueuePresentKHR},
     {"vkCreateXlibSurfaceKHR", vt_call_vkCreateXlibSurfaceKHR},
+    {"vkCreateXcbSurfaceKHR", vt_call_vkCreateXcbSurfaceKHR},
     {"vkGetPhysicalDeviceXlibPresentationSupportKHR", vt_call_vkGetPhysicalDeviceXlibPresentationSupportKHR},
+    {"vkGetPhysicalDeviceXcbPresentationSupportKHR", vt_call_vkGetPhysicalDeviceXcbPresentationSupportKHR},
     {"vkGetPhysicalDeviceFeatures2", vt_call_vkGetPhysicalDeviceFeatures2},
     {"vkGetPhysicalDeviceFeatures2KHR", vt_call_vkGetPhysicalDeviceFeatures2},
     {"vkGetPhysicalDeviceProperties2", vt_call_vkGetPhysicalDeviceProperties2},

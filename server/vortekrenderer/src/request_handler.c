@@ -9,7 +9,7 @@ void vt_handle_vkCreateInstance(VkContext* context) {
     VkInstanceCreateInfo createInfo = {0};
     vt_unserialize_vkCreateInstance(&createInfo, NULL, NULL, context->inputBuffer, &context->memoryPool);
 
-    const char* skipExtensions[] = {"VK_KHR_surface", "VK_KHR_xlib_surface"};
+    const char* skipExtensions[] = {"VK_KHR_surface", "VK_KHR_xlib_surface", "VK_KHR_xcb_surface"};
 
 #if ENABLE_VALIDATION_LAYER
     createInfo.ppEnabledLayerNames = validationLayers;
@@ -196,8 +196,8 @@ void vt_handle_vkEnumerateInstanceExtensionProperties(VkContext* context) {
     VkExtensionProperties* exposedExtensions = vt_alloc(&context->memoryPool, propertyCount * sizeof(VkExtensionProperties));
     result = vulkanWrapper.vkEnumerateInstanceExtensionProperties(NULL, &exposedExtensionCount, exposedExtensions);
 
-    const char* extraExtensions[] = {"VK_KHR_surface", "VK_KHR_xlib_surface"};
-    int extraExtensionCount = XWindowSwapchain_hasWindowProvider(&context->jmethods) ? ARRAY_SIZE(extraExtensions) : 0;
+    const char* extraExtensions[] = {"VK_KHR_surface", "VK_KHR_xlib_surface", "VK_KHR_xcb_surface"};
+    int extraExtensionCount = XWindowSwapchain_hasPresentationBackend(&context->jmethods) ? ARRAY_SIZE(extraExtensions) : 0;
     const char* skipExtensions[] = {"VK_KHR_android_surface"};
     injectExtensions2(context, &exposedExtensions, &exposedExtensionCount,
                       extraExtensions, extraExtensionCount,
@@ -1945,10 +1945,10 @@ void vt_handle_vkCmdExecuteCommands(VkContext* context) {
 
 void vt_handle_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkContext* context) {
     uint64_t physicalDeviceId;
-    uint64_t windowId;
+    uint64_t windowId = 0;
 
     vt_unserialize_vkGetPhysicalDeviceSurfaceCapabilitiesKHR((VkPhysicalDevice)&physicalDeviceId, (VkSurfaceKHR)&windowId, NULL, context->inputBuffer, &context->memoryPool);
-    if (!XWindowSwapchain_hasWindowProvider(&context->jmethods)) {
+    if (!XWindowSwapchain_hasPresentationBackend(&context->jmethods)) {
         VkSurfaceCapabilitiesKHR surfaceCapabilities = {0};
         VT_SERIALIZE_CMD(VkSurfaceCapabilitiesKHR, &surfaceCapabilities);
         vt_send(context->clientRing, VK_ERROR_SURFACE_LOST_KHR, outputBuffer, bufferSize);
@@ -1956,7 +1956,12 @@ void vt_handle_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkContext* context) {
     }
 
     VkExtent2D windowSize;
-    getWindowExtent(&context->jmethods, windowId, &windowSize);
+    if (!XWindowSwapchain_getWindowExtent(&context->jmethods, windowId, &windowSize)) {
+        VkSurfaceCapabilitiesKHR surfaceCapabilities = {0};
+        VT_SERIALIZE_CMD(VkSurfaceCapabilitiesKHR, &surfaceCapabilities);
+        vt_send(context->clientRing, VK_ERROR_SURFACE_LOST_KHR, outputBuffer, bufferSize);
+        return;
+    }
 
     VkSurfaceCapabilitiesKHR surfaceCapabilities = {0};
     surfaceCapabilities.minImageCount = getSurfaceMinImageCount();
@@ -1967,8 +1972,10 @@ void vt_handle_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkContext* context) {
     surfaceCapabilities.maxImageArrayLayers = 1;
     surfaceCapabilities.supportedTransforms = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
     surfaceCapabilities.currentTransform = VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-    surfaceCapabilities.supportedCompositeAlpha = VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR |
-                                                  VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+    surfaceCapabilities.supportedCompositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR |
+                                                  VK_COMPOSITE_ALPHA_INHERIT_BIT_KHR |
+                                                  VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR |
+                                                  VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR;
     surfaceCapabilities.supportedUsageFlags = VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
                                               VK_IMAGE_USAGE_SAMPLED_BIT |
                                               VK_IMAGE_USAGE_TRANSFER_DST_BIT |
@@ -1982,12 +1989,22 @@ void vt_handle_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkContext* context) {
 
 void vt_handle_vkGetPhysicalDeviceSurfaceFormatsKHR(VkContext* context) {
     uint64_t physicalDeviceId;
+    uint64_t windowId = 0;
     uint32_t surfaceFormatCount;
 
-    vt_unserialize_vkGetPhysicalDeviceSurfaceFormatsKHR((VkPhysicalDevice)&physicalDeviceId, NULL, &surfaceFormatCount, NULL, context->inputBuffer, &context->memoryPool);
+    vt_unserialize_vkGetPhysicalDeviceSurfaceFormatsKHR((VkPhysicalDevice)&physicalDeviceId, (VkSurfaceKHR)&windowId, &surfaceFormatCount, NULL, context->inputBuffer, &context->memoryPool);
+    if (!XWindowSwapchain_hasPresentationBackend(&context->jmethods)) {
+        surfaceFormatCount = 0;
+        VT_SERIALIZE_CMD(vkGetPhysicalDeviceSurfaceFormatsKHR, VK_NULL_HANDLE, VK_NULL_HANDLE, &surfaceFormatCount, NULL);
+        vt_send(context->clientRing, VK_ERROR_SURFACE_LOST_KHR, outputBuffer, bufferSize);
+        return;
+    }
 
     VkSurfaceFormatKHR* surfaceFormats = surfaceFormatCount > 0 ? getSurfaceFormats(&surfaceFormatCount) : NULL;
-    if (surfaceFormatCount == 0) getSurfaceFormats(&surfaceFormatCount);
+    if (surfaceFormatCount == 0) {
+        VkSurfaceFormatKHR* countFormats = getSurfaceFormats(&surfaceFormatCount);
+        MEMFREE(countFormats);
+    }
 
     VT_SERIALIZE_CMD(vkGetPhysicalDeviceSurfaceFormatsKHR, VK_NULL_HANDLE, NULL, &surfaceFormatCount, surfaceFormats);
     vt_send(context->clientRing, VK_SUCCESS, outputBuffer, bufferSize);
@@ -2001,12 +2018,25 @@ void vt_handle_vkGetPhysicalDeviceSurfacePresentModesKHR(VkContext* context) {
                                                              VK_PRESENT_MODE_FIFO_KHR,
                                                              VK_PRESENT_MODE_FIFO_RELAXED_KHR};
     uint64_t physicalDeviceId;
+    uint64_t windowId = 0;
     uint32_t presentModeCount;
 
-    vt_unserialize_vkGetPhysicalDeviceSurfacePresentModesKHR((VkPhysicalDevice)&physicalDeviceId, NULL, &presentModeCount, NULL, context->inputBuffer, &context->memoryPool);
+    vt_unserialize_vkGetPhysicalDeviceSurfacePresentModesKHR((VkPhysicalDevice)&physicalDeviceId, (VkSurfaceKHR)&windowId, &presentModeCount, NULL, context->inputBuffer, &context->memoryPool);
+    if (!XWindowSwapchain_hasPresentationBackend(&context->jmethods)) {
+        presentModeCount = 0;
+        VT_SERIALIZE_CMD(vkGetPhysicalDeviceSurfacePresentModesKHR, VK_NULL_HANDLE, VK_NULL_HANDLE, &presentModeCount, NULL);
+        vt_send(context->clientRing, VK_ERROR_SURFACE_LOST_KHR, outputBuffer, bufferSize);
+        return;
+    }
 
+    uint32_t supportedPresentModeCount = ARRAY_SIZE(supportedPresentModes);
+    if (presentModeCount == 0) {
+        presentModeCount = supportedPresentModeCount;
+    }
+    else if (presentModeCount > supportedPresentModeCount) {
+        presentModeCount = supportedPresentModeCount;
+    }
     VkPresentModeKHR* presentModes = presentModeCount > 0 ? supportedPresentModes : NULL;
-    if (presentModeCount == 0) presentModeCount = ARRAY_SIZE(supportedPresentModes);
 
     VT_SERIALIZE_CMD(vkGetPhysicalDeviceSurfacePresentModesKHR, VK_NULL_HANDLE, NULL, &presentModeCount, presentModes);
     vt_send(context->clientRing, VK_SUCCESS, outputBuffer, bufferSize);
@@ -2015,21 +2045,25 @@ void vt_handle_vkGetPhysicalDeviceSurfacePresentModesKHR(VkContext* context) {
 void vt_handle_vkCreateSwapchainKHR(VkContext* context) {
     uint64_t deviceId;
     VkSwapchainCreateInfoKHR createInfo = {0};
-    uint64_t windowId;
+    uint64_t windowId = 0;
     createInfo.surface = (VkSurfaceKHR)&windowId;
 
     vt_unserialize_vkCreateSwapchainKHR((VkDevice)&deviceId, &createInfo, NULL, NULL, context->inputBuffer, &context->memoryPool);
     VkDevice device = VkObject_fromId(deviceId);
 
     VkResult result = VK_SUCCESS;
-    if (!XWindowSwapchain_hasWindowProvider(&context->jmethods)) {
+    if (!XWindowSwapchain_hasPresentationBackend(&context->jmethods)) {
         VT_SERIALIZE_CMD(VkSwapchainKHR, VK_NULL_HANDLE);
         vt_send(context->clientRing, VK_ERROR_SURFACE_LOST_KHR, outputBuffer, bufferSize);
         return;
     }
 
     VkExtent2D windowSize;
-    getWindowExtent(&context->jmethods, windowId, &windowSize);
+    if (!XWindowSwapchain_getWindowExtent(&context->jmethods, windowId, &windowSize)) {
+        VT_SERIALIZE_CMD(VkSwapchainKHR, VK_NULL_HANDLE);
+        vt_send(context->clientRing, VK_ERROR_SURFACE_LOST_KHR, outputBuffer, bufferSize);
+        return;
+    }
 
     XWindowSwapchain* swapchain = NULL;
     if (createInfo.imageExtent.width == windowSize.width && createInfo.imageExtent.height == windowSize.height) {
@@ -2109,11 +2143,15 @@ void vt_handle_vkQueuePresentKHR(VkContext* context) {
     VkPresentInfoKHR presentInfo = {0};
     vt_unserialize_VkPresentInfoKHR(&presentInfo, context->inputBuffer, &context->memoryPool);
 
-    if (!XWindowSwapchain_hasWindowProvider(&context->jmethods)) return;
-
+    VkResult result = VK_SUCCESS;
     for (int i = 0; i < presentInfo.swapchainCount; i++) {
-        XWindowSwapchain_presentImage((XWindowSwapchain*)presentInfo.pSwapchains[i]);
+        uint32_t imageIndex = presentInfo.pImageIndices ? presentInfo.pImageIndices[i] : 0;
+        VkResult presentResult = XWindowSwapchain_presentImage((XWindowSwapchain*)presentInfo.pSwapchains[i], imageIndex);
+        if (presentInfo.pResults) presentInfo.pResults[i] = presentResult;
+        if (result == VK_SUCCESS && presentResult != VK_SUCCESS) result = presentResult;
     }
+
+    vt_send(context->clientRing, result, NULL, 0);
 }
 
 void vt_handle_vkGetPhysicalDeviceFeatures2(VkContext* context) {
@@ -2426,6 +2464,10 @@ void vt_handle_vkAcquireNextImage2KHR(VkContext* context) {
     VkAcquireNextImageInfoKHR acquireInfo = {0};
     vt_unserialize_VkAcquireNextImageInfoKHR(&acquireInfo, context->inputBuffer, &context->memoryPool);
     XWindowSwapchain* swapchain = (XWindowSwapchain*)acquireInfo.swapchain;
+    if (!swapchain) {
+        vt_send(context->clientRing, VK_ERROR_SURFACE_LOST_KHR, NULL, 0);
+        return;
+    }
 
     uint32_t imageIndex = 0;
     VkResult result = XWindowSwapchain_acquireNextImage(swapchain, acquireInfo.timeout, acquireInfo.semaphore, acquireInfo.fence, &imageIndex);
@@ -2451,11 +2493,19 @@ void vt_handle_vkCmdDispatchBase(VkContext* context) {
 
 void vt_handle_vkGetPhysicalDevicePresentRectanglesKHR(VkContext* context) {
     uint64_t physicalDeviceId;
-    uint64_t windowId;
+    uint64_t windowId = 0;
     uint32_t rectCount;
 
     vt_unserialize_vkGetPhysicalDevicePresentRectanglesKHR((VkPhysicalDevice)&physicalDeviceId, (VkSurfaceKHR)&windowId, &rectCount, NULL, context->inputBuffer, &context->memoryPool);
-    if (!XWindowSwapchain_hasWindowProvider(&context->jmethods)) {
+    if (!XWindowSwapchain_hasPresentationBackend(&context->jmethods)) {
+        rectCount = 0;
+        VT_SERIALIZE_CMD(vkGetPhysicalDevicePresentRectanglesKHR, VK_NULL_HANDLE, VK_NULL_HANDLE, &rectCount, NULL);
+        vt_send(context->clientRing, VK_ERROR_SURFACE_LOST_KHR, outputBuffer, bufferSize);
+        return;
+    }
+
+    VkExtent2D windowSize;
+    if (!XWindowSwapchain_getWindowExtent(&context->jmethods, windowId, &windowSize)) {
         rectCount = 0;
         VT_SERIALIZE_CMD(vkGetPhysicalDevicePresentRectanglesKHR, VK_NULL_HANDLE, VK_NULL_HANDLE, &rectCount, NULL);
         vt_send(context->clientRing, VK_ERROR_SURFACE_LOST_KHR, outputBuffer, bufferSize);
@@ -2463,7 +2513,7 @@ void vt_handle_vkGetPhysicalDevicePresentRectanglesKHR(VkContext* context) {
     }
 
     VkRect2D* rects = rectCount > 0 ? calloc(1, sizeof(VkRect2D)) : NULL;
-    if (rects) getWindowExtent(&context->jmethods, windowId, &rects[0].extent);
+    if (rects) rects[0].extent = windowSize;
     rectCount = 1;
 
     VT_SERIALIZE_CMD(vkGetPhysicalDevicePresentRectanglesKHR, VK_NULL_HANDLE, VK_NULL_HANDLE, &rectCount, rects);
