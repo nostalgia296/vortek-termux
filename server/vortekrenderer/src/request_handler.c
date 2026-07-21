@@ -2198,15 +2198,31 @@ void vt_handle_vkQueuePresentKHR(VkContext* context) {
         }
     }
 
+#ifndef VORTEK_CLI_X11
     if (presentInfo.waitSemaphoreCount > 0) {
         result = XWindowSwapchain_waitForPresent(waitSwapchain, presentInfo.waitSemaphoreCount, presentInfo.pWaitSemaphores);
     }
+#endif
 
+#ifdef VORTEK_CLI_X11
+    bool waitSemaphoresConsumed = presentInfo.waitSemaphoreCount == 0;
+#endif
     for (int i = 0; i < presentInfo.swapchainCount; i++) {
         uint32_t imageIndex = presentInfo.pImageIndices ? presentInfo.pImageIndices[i] : 0;
+#ifdef VORTEK_CLI_X11
+        bool consumeWaitSemaphores = !waitSemaphoresConsumed && presentInfo.pSwapchains[i] == (VkSwapchainKHR)waitSwapchain;
+        uint32_t waitSemaphoreCount = consumeWaitSemaphores ? presentInfo.waitSemaphoreCount : 0;
+        const VkSemaphore* waitSemaphores = consumeWaitSemaphores ? presentInfo.pWaitSemaphores : NULL;
+        VkResult presentResult = result == VK_SUCCESS ?
+                                 XWindowSwapchain_presentImageWithWaits((XWindowSwapchain*)presentInfo.pSwapchains[i], imageIndex,
+                                                                      waitSemaphoreCount, waitSemaphores) :
+                                 result;
+        if (consumeWaitSemaphores) waitSemaphoresConsumed = true;
+#else
         VkResult presentResult = result == VK_SUCCESS ?
                                  XWindowSwapchain_presentImage((XWindowSwapchain*)presentInfo.pSwapchains[i], imageIndex) :
                                  result;
+#endif
         if (presentInfo.pResults) presentInfo.pResults[i] = presentResult;
         if (result == VK_SUCCESS && presentResult != VK_SUCCESS) result = presentResult;
     }

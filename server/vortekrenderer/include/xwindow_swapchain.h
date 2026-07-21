@@ -9,6 +9,8 @@ typedef struct XWindowSwapchain_Image {
     VkImage image;
     VkDeviceMemory memory;
 #ifdef VORTEK_CLI_X11
+    VkCommandBuffer commandBuffer;
+    VkFence presentFence;
     VkBuffer readbackBuffer;
     VkDeviceMemory readbackMemory;
     void* readbackData;
@@ -28,16 +30,11 @@ typedef struct XWindowSwapchain {
 #ifdef VORTEK_CLI_X11
     VkDevice device;
     VkCommandPool commandPool;
-    VkCommandBuffer commandBuffer;
     void* x11Display;
     void* x11Image;
     void* x11GC;
-    char* x11ImageData;
-    int x11Screen;
+    void* x11ShmInfo;
     unsigned long x11Window;
-    unsigned long x11RedMask;
-    unsigned long x11GreenMask;
-    unsigned long x11BlueMask;
 #endif
 } XWindowSwapchain;
 
@@ -52,6 +49,9 @@ extern XWindowSwapchain* XWindowSwapchain_create(VkDevice device, uint32_t graph
 extern void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain);
 extern VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t timeout, VkSemaphore signalSemaphore, VkFence fence, uint32_t* imageIndex);
 extern VkResult XWindowSwapchain_waitForPresent(XWindowSwapchain* swapchain, uint32_t waitSemaphoreCount, const VkSemaphore* waitSemaphores);
+#ifdef VORTEK_CLI_X11
+extern VkResult XWindowSwapchain_presentImageWithWaits(XWindowSwapchain* swapchain, uint32_t imageIndex, uint32_t waitSemaphoreCount, const VkSemaphore* waitSemaphores);
+#endif
 extern VkResult XWindowSwapchain_presentImage(XWindowSwapchain* swapchain, uint32_t imageIndex);
 
 #endif

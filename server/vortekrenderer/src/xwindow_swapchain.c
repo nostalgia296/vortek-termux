@@ -4,6 +4,13 @@
 #ifdef VORTEK_CLI_X11
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
+#include <X11/extensions/XShm.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+
+#if defined(__aarch64__) || defined(__ARM_NEON)
+#include <arm_neon.h>
+#endif
 
 static Display* globalX11Display = NULL;
 static bool globalX11DisplayChecked = false;
@@ -85,19 +92,100 @@ static int maskBits(unsigned long mask) {
     return bits;
 }
 
-static unsigned long componentToMask(uint8_t value, unsigned long mask) {
-    if (!mask) return 0;
-
-    int bits = maskBits(mask);
-    int shift = maskShift(mask);
-    unsigned long component = bits >= 8 ? value << (bits - 8) : value >> (8 - bits);
-    return (component << shift) & mask;
+static bool isX11ShmEnabled() {
+    const char* value = getenv("VORTEK_CLI_X11_SHM");
+    return !value || !value[0] || strcmp(value, "0") != 0;
 }
 
-static unsigned long makeX11Pixel(XWindowSwapchain* swapchain, uint8_t r, uint8_t g, uint8_t b) {
-    return componentToMask(r, swapchain->x11RedMask) |
-           componentToMask(g, swapchain->x11GreenMask) |
-           componentToMask(b, swapchain->x11BlueMask);
+static void destroyX11Image(Display* display, XImage* image, XShmSegmentInfo* shmInfo) {
+    if (shmInfo) {
+        beginX11ErrorTrap(display);
+        XShmDetach(display, shmInfo);
+        endX11ErrorTrap(display);
+
+        char* shmaddr = shmInfo->shmaddr;
+        int shmid = shmInfo->shmid;
+        if (image) image->data = NULL;
+        if (image) XDestroyImage(image);
+        if (shmaddr && shmaddr != (char*)-1) shmdt(shmaddr);
+        if (shmid >= 0) shmctl(shmid, IPC_RMID, NULL);
+        free(shmInfo);
+        return;
+    }
+
+    if (image) XDestroyImage(image);
+}
+
+static XImage* createSharedX11Image(Display* display, Visual* visual, int depth,
+                                    uint32_t width, uint32_t height, XShmSegmentInfo** outShmInfo) {
+    *outShmInfo = NULL;
+    if (!isX11ShmEnabled() || !XShmQueryExtension(display)) return NULL;
+
+    XShmSegmentInfo* shmInfo = calloc(1, sizeof(XShmSegmentInfo));
+    if (!shmInfo) return NULL;
+    shmInfo->shmid = -1;
+    shmInfo->shmaddr = (char*)-1;
+
+    XImage* image = XShmCreateImage(display, visual, depth, ZPixmap, NULL, shmInfo, width, height);
+    if (!image || image->bytes_per_line <= 0 || image->height <= 0) goto error;
+
+    size_t imageSize = (size_t)image->bytes_per_line * (size_t)image->height;
+    if (imageSize / (size_t)image->height != (size_t)image->bytes_per_line) goto error;
+
+    shmInfo->shmid = shmget(IPC_PRIVATE, imageSize, IPC_CREAT | 0600);
+    if (shmInfo->shmid < 0) goto error;
+
+    shmInfo->shmaddr = shmat(shmInfo->shmid, NULL, 0);
+    if (shmInfo->shmaddr == (char*)-1) goto error;
+
+    shmInfo->readOnly = False;
+    image->data = shmInfo->shmaddr;
+
+    beginX11ErrorTrap(display);
+    Bool attached = XShmAttach(display, shmInfo);
+    bool attachSucceeded = endX11ErrorTrap(display);
+    if (!attached || !attachSucceeded) {
+        if (attached) {
+            beginX11ErrorTrap(display);
+            XShmDetach(display, shmInfo);
+            endX11ErrorTrap(display);
+        }
+        goto error;
+    }
+
+    shmctl(shmInfo->shmid, IPC_RMID, NULL);
+    *outShmInfo = shmInfo;
+    return image;
+
+error:
+    if (image) image->data = NULL;
+    if (image) XDestroyImage(image);
+    if (shmInfo->shmaddr && shmInfo->shmaddr != (char*)-1) shmdt(shmInfo->shmaddr);
+    if (shmInfo->shmid >= 0) shmctl(shmInfo->shmid, IPC_RMID, NULL);
+    free(shmInfo);
+    return NULL;
+}
+
+static XImage* createPlainX11Image(Display* display, Visual* visual, int depth,
+                                   uint32_t width, uint32_t height) {
+    XImage* image = XCreateImage(display, visual, depth, ZPixmap, 0, NULL, width, height, 32, 0);
+    if (!image || image->bytes_per_line <= 0 || image->height <= 0) {
+        if (image) XDestroyImage(image);
+        return NULL;
+    }
+
+    size_t imageSize = (size_t)image->bytes_per_line * (size_t)image->height;
+    if (imageSize / (size_t)image->height != (size_t)image->bytes_per_line) {
+        XDestroyImage(image);
+        return NULL;
+    }
+
+    image->data = calloc(1, imageSize);
+    if (!image->data) {
+        XDestroyImage(image);
+        return NULL;
+    }
+    return image;
 }
 
 static bool createX11Image(XWindowSwapchain* swapchain) {
@@ -113,33 +201,26 @@ static bool createX11Image(XWindowSwapchain* swapchain) {
     int screen = attrs.screen ? XScreenNumberOfScreen(attrs.screen) : DefaultScreen(display);
     Visual* visual = attrs.visual ? attrs.visual : DefaultVisual(display, screen);
     int depth = attrs.depth > 0 ? attrs.depth : DefaultDepth(display, screen);
-    char* data = calloc(swapchain->imageExtent.width * swapchain->imageExtent.height, 4);
-    if (!data) return false;
-
-    XImage* image = XCreateImage(display, visual, depth, ZPixmap, 0, data,
-                                 swapchain->imageExtent.width, swapchain->imageExtent.height, 32, 0);
-    if (!image) {
-        free(data);
-        return false;
-    }
+    XShmSegmentInfo* shmInfo = NULL;
+    XImage* image = createSharedX11Image(display, visual, depth, swapchain->imageExtent.width,
+                                         swapchain->imageExtent.height, &shmInfo);
+    if (!image) image = createPlainX11Image(display, visual, depth, swapchain->imageExtent.width,
+                                             swapchain->imageExtent.height);
+    if (!image) return false;
 
     beginX11ErrorTrap(display);
     GC gc = XCreateGC(display, (Window)swapchain->windowId, 0, NULL);
     bool gcSuccess = endX11ErrorTrap(display);
     if (!gcSuccess || !gc) {
-        XDestroyImage(image);
+        destroyX11Image(display, image, shmInfo);
         return false;
     }
 
     swapchain->x11Display = display;
     swapchain->x11Image = image;
     swapchain->x11GC = gc;
-    swapchain->x11ImageData = data;
-    swapchain->x11Screen = screen;
+    swapchain->x11ShmInfo = shmInfo;
     swapchain->x11Window = (Window)swapchain->windowId;
-    swapchain->x11RedMask = visual->red_mask;
-    swapchain->x11GreenMask = visual->green_mask;
-    swapchain->x11BlueMask = visual->blue_mask;
     return true;
 }
 #endif
@@ -368,13 +449,23 @@ static VkResult createCliCommandResources(VkDevice device, uint32_t graphicsQueu
     VkResult result = vulkanWrapper.vkCreateCommandPool(device, &poolInfo, NULL, &swapchain->commandPool);
     if (result != VK_SUCCESS) return result;
 
-    VkCommandBufferAllocateInfo allocateInfo = {0};
-    allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    allocateInfo.commandPool = swapchain->commandPool;
-    allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    allocateInfo.commandBufferCount = 1;
+    for (int i = 0; i < swapchain->imageCount; i++) {
+        VkCommandBufferAllocateInfo allocateInfo = {0};
+        allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocateInfo.commandPool = swapchain->commandPool;
+        allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocateInfo.commandBufferCount = 1;
 
-    return vulkanWrapper.vkAllocateCommandBuffers(device, &allocateInfo, &swapchain->commandBuffer);
+        result = vulkanWrapper.vkAllocateCommandBuffers(device, &allocateInfo, &swapchain->images[i].commandBuffer);
+        if (result != VK_SUCCESS) return result;
+
+        VkFenceCreateInfo fenceInfo = {0};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        result = vulkanWrapper.vkCreateFence(device, &fenceInfo, NULL, &swapchain->images[i].presentFence);
+        if (result != VK_SUCCESS) return result;
+    }
+
+    return VK_SUCCESS;
 }
 #endif
 
@@ -443,6 +534,7 @@ void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain) {
     if (!swapchain) return;
     for (int i = 0; i < swapchain->imageCount; i++) {
 #ifdef VORTEK_CLI_X11
+        if (swapchain->images[i].presentFence) vulkanWrapper.vkDestroyFence(device, swapchain->images[i].presentFence, NULL);
         if (swapchain->images[i].readbackData) vulkanWrapper.vkUnmapMemory(device, swapchain->images[i].readbackMemory);
         if (swapchain->images[i].readbackBuffer) vulkanWrapper.vkDestroyBuffer(device, swapchain->images[i].readbackBuffer, NULL);
         if (swapchain->images[i].readbackMemory) vulkanWrapper.vkFreeMemory(device, swapchain->images[i].readbackMemory, NULL);
@@ -454,7 +546,10 @@ void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain) {
 #ifdef VORTEK_CLI_X11
     if (swapchain->commandPool) vulkanWrapper.vkDestroyCommandPool(device, swapchain->commandPool, NULL);
     if (swapchain->x11GC) XFreeGC((Display*)swapchain->x11Display, (GC)swapchain->x11GC);
-    if (swapchain->x11Image) XDestroyImage((XImage*)swapchain->x11Image);
+    if (swapchain->x11Image) {
+        destroyX11Image((Display*)swapchain->x11Display, (XImage*)swapchain->x11Image,
+                        (XShmSegmentInfo*)swapchain->x11ShmInfo);
+    }
 #endif
 
     MEMFREE(swapchain->images);
@@ -514,55 +609,162 @@ VkResult XWindowSwapchain_waitForPresent(XWindowSwapchain* swapchain, uint32_t w
 }
 
 #ifdef VORTEK_CLI_X11
-static bool uploadReadbackToX11(XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage) {
-    XImage* ximage = (XImage*)swapchain->x11Image;
-    if (!ximage || !swapchainImage->readbackData) return false;
+static int getChannelByteOffset(XImage* image, unsigned long mask) {
+    int bytesPerPixel = (image->bits_per_pixel + 7) / 8;
+    int shift = maskShift(mask);
+    if (maskBits(mask) != 8 || (shift & 7) != 0 || (mask >> shift) != 0xff) return -1;
 
-    uint8_t* src = swapchainImage->readbackData;
+    int offset = shift / 8;
+    if (image->byte_order == MSBFirst) offset = bytesPerPixel - 1 - offset;
+    return offset >= 0 && offset < bytesPerPixel ? offset : -1;
+}
+
+static unsigned long scaleChannelToMask(uint8_t value, unsigned long mask) {
+    if (!mask) return 0;
+
+    int shift = maskShift(mask);
+    uint64_t maxValue = mask >> shift;
+    uint64_t scaled = ((uint64_t)value * maxValue + 127) / 255;
+    return (unsigned long)((scaled << shift) & mask);
+}
+
+static void writePackedPixel(uint8_t* destination, unsigned long pixel, int bytesPerPixel, int byteOrder) {
+    for (int i = 0; i < bytesPerPixel; i++) {
+        int destinationByte = byteOrder == MSBFirst ? bytesPerPixel - 1 - i : i;
+        destination[destinationByte] = (uint8_t)(pixel >> (i * 8));
+    }
+}
+
+static void copySwappedRedBlue32(uint8_t* destination, const uint8_t* source, uint32_t width) {
+    uint32_t x = 0;
+#if defined(__aarch64__) || defined(__ARM_NEON)
+    for (; x + 16 <= width; x += 16) {
+        uint8x16x4_t pixels = vld4q_u8(source + (size_t)x * 4);
+        uint8x16_t red = pixels.val[0];
+        pixels.val[0] = pixels.val[2];
+        pixels.val[2] = red;
+        vst4q_u8(destination + (size_t)x * 4, pixels);
+    }
+#endif
+    for (; x < width; x++) {
+        const uint8_t* srcPixel = source + (size_t)x * 4;
+        uint8_t* dstPixel = destination + (size_t)x * 4;
+        dstPixel[0] = srcPixel[2];
+        dstPixel[1] = srcPixel[1];
+        dstPixel[2] = srcPixel[0];
+        dstPixel[3] = srcPixel[3];
+    }
+}
+
+static bool copyReadbackToX11Image(XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage) {
+    XImage* image = (XImage*)swapchain->x11Image;
+    if (!image || !image->data || !swapchainImage->readbackData) return false;
+
     uint32_t width = swapchain->imageExtent.width;
     uint32_t height = swapchain->imageExtent.height;
+    int bytesPerPixel = (image->bits_per_pixel + 7) / 8;
+    if (bytesPerPixel <= 0 || bytesPerPixel > 4 || image->width < (int)width || image->height < (int)height) return false;
+    if (image->bytes_per_line < (int)((size_t)width * bytesPerPixel)) return false;
 
+    bool sourceIsRgba = swapchain->imageFormat == VK_FORMAT_R8G8B8A8_UNORM ||
+                        swapchain->imageFormat == VK_FORMAT_R8G8B8A8_SRGB;
+    bool sourceIsBgra = swapchain->imageFormat == VK_FORMAT_B8G8R8A8_UNORM ||
+                        swapchain->imageFormat == VK_FORMAT_B8G8R8A8_SRGB;
+    if (!sourceIsRgba && !sourceIsBgra) return false;
+
+    int sourceRedOffset = sourceIsRgba ? 0 : 2;
+    int sourceGreenOffset = 1;
+    int sourceBlueOffset = sourceIsRgba ? 2 : 0;
+    int destinationRedOffset = getChannelByteOffset(image, image->red_mask);
+    int destinationGreenOffset = getChannelByteOffset(image, image->green_mask);
+    int destinationBlueOffset = getChannelByteOffset(image, image->blue_mask);
+
+    bool canCopyDirectly = bytesPerPixel == 4 &&
+                           destinationRedOffset == sourceRedOffset &&
+                           destinationGreenOffset == sourceGreenOffset &&
+                           destinationBlueOffset == sourceBlueOffset;
+    bool canSwapRedBlue = bytesPerPixel == 4 &&
+                          destinationRedOffset == sourceBlueOffset &&
+                          destinationGreenOffset == sourceGreenOffset &&
+                          destinationBlueOffset == sourceRedOffset;
+    bool byteAddressable = destinationRedOffset >= 0 && destinationGreenOffset >= 0 && destinationBlueOffset >= 0;
+
+    const uint8_t* source = swapchainImage->readbackData;
     for (uint32_t y = 0; y < height; y++) {
-        uint8_t* row = src + ((size_t)y * width * 4);
+        const uint8_t* sourceRow = source + (size_t)y * width * 4;
+        uint8_t* destinationRow = (uint8_t*)image->data + (size_t)y * image->bytes_per_line;
+
+        if (canCopyDirectly) {
+            memcpy(destinationRow, sourceRow, (size_t)width * 4);
+            continue;
+        }
+        if (canSwapRedBlue) {
+            copySwappedRedBlue32(destinationRow, sourceRow, width);
+            continue;
+        }
+
         for (uint32_t x = 0; x < width; x++) {
-            uint8_t r, g, b;
-            if (swapchain->imageFormat == VK_FORMAT_R8G8B8A8_UNORM || swapchain->imageFormat == VK_FORMAT_R8G8B8A8_SRGB) {
-                r = row[x * 4 + 0];
-                g = row[x * 4 + 1];
-                b = row[x * 4 + 2];
+            const uint8_t* sourcePixel = sourceRow + (size_t)x * 4;
+            uint8_t* destinationPixel = destinationRow + (size_t)x * bytesPerPixel;
+            uint8_t red = sourcePixel[sourceRedOffset];
+            uint8_t green = sourcePixel[sourceGreenOffset];
+            uint8_t blue = sourcePixel[sourceBlueOffset];
+
+            if (byteAddressable) {
+                destinationPixel[destinationRedOffset] = red;
+                destinationPixel[destinationGreenOffset] = green;
+                destinationPixel[destinationBlueOffset] = blue;
             }
             else {
-                b = row[x * 4 + 0];
-                g = row[x * 4 + 1];
-                r = row[x * 4 + 2];
+                unsigned long pixel = scaleChannelToMask(red, image->red_mask) |
+                                      scaleChannelToMask(green, image->green_mask) |
+                                      scaleChannelToMask(blue, image->blue_mask);
+                writePackedPixel(destinationPixel, pixel, bytesPerPixel, image->byte_order);
             }
-
-            XPutPixel(ximage, x, y, makeX11Pixel(swapchain, r, g, b));
         }
     }
 
-    Display* display = (Display*)swapchain->x11Display;
-    beginX11ErrorTrap(display);
-    XPutImage(display, (Window)swapchain->x11Window, (GC)swapchain->x11GC,
-              ximage, 0, 0, 0, 0, width, height);
-    XFlush(display);
-    return endX11ErrorTrap(display);
+    return true;
 }
 
-static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex) {
-    if (!swapchain->x11Display || !swapchain->commandBuffer || imageIndex >= (uint32_t)swapchain->imageCount) {
+static bool uploadReadbackToX11(XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage) {
+    XImage* ximage = (XImage*)swapchain->x11Image;
+    if (!copyReadbackToX11Image(swapchain, swapchainImage)) return false;
+
+    uint32_t width = swapchain->imageExtent.width;
+    uint32_t height = swapchain->imageExtent.height;
+
+    Display* display = (Display*)swapchain->x11Display;
+    beginX11ErrorTrap(display);
+    bool submitted;
+    if (swapchain->x11ShmInfo) {
+        submitted = XShmPutImage(display, (Window)swapchain->x11Window, (GC)swapchain->x11GC,
+                                 ximage, 0, 0, 0, 0, width, height, False) == True;
+    }
+    else {
+        XPutImage(display, (Window)swapchain->x11Window, (GC)swapchain->x11GC,
+                  ximage, 0, 0, 0, 0, width, height);
+        submitted = true;
+    }
+    XFlush(display);
+    bool x11Succeeded = endX11ErrorTrap(display);
+    return submitted && x11Succeeded;
+}
+
+static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex,
+                                uint32_t waitSemaphoreCount, const VkSemaphore* waitSemaphores) {
+    if (!swapchain->x11Display || imageIndex >= (uint32_t)swapchain->imageCount) {
         return VK_ERROR_SURFACE_LOST_KHR;
     }
 
     XWindowSwapchain_Image* swapchainImage = &swapchain->images[imageIndex];
+    if (!swapchainImage->commandBuffer || !swapchainImage->presentFence) return VK_ERROR_INITIALIZATION_FAILED;
+
     VkDevice device = swapchain->device;
-    VkCommandBuffer commandBuffer = swapchain->commandBuffer;
+    VkCommandBuffer commandBuffer = swapchainImage->commandBuffer;
     VkDeviceSize bufferSize = (VkDeviceSize)swapchain->imageExtent.width * swapchain->imageExtent.height * 4;
 
-    VkResult result = vulkanWrapper.vkQueueWaitIdle(swapchain->queue);
-    if (result != VK_SUCCESS) return result;
-
-    result = vulkanWrapper.vkResetCommandBuffer(commandBuffer, 0);
+    VkResult result = vulkanWrapper.vkResetCommandBuffer(commandBuffer, 0);
     if (result != VK_SUCCESS) return result;
 
     VkCommandBufferBeginInfo beginInfo = {0};
@@ -615,13 +817,23 @@ static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex
 
     VkSubmitInfo submitInfo = {0};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    VkPipelineStageFlags waitStages[waitSemaphoreCount > 0 ? waitSemaphoreCount : 1];
+    for (uint32_t i = 0; i < waitSemaphoreCount; i++) {
+        waitStages[i] = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    }
+    submitInfo.waitSemaphoreCount = waitSemaphoreCount;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = waitSemaphoreCount > 0 ? waitStages : NULL;
     submitInfo.commandBufferCount = 1;
     submitInfo.pCommandBuffers = &commandBuffer;
 
-    result = vulkanWrapper.vkQueueSubmit(swapchain->queue, 1, &submitInfo, VK_NULL_HANDLE);
+    result = vulkanWrapper.vkResetFences(device, 1, &swapchainImage->presentFence);
     if (result != VK_SUCCESS) return result;
 
-    result = vulkanWrapper.vkQueueWaitIdle(swapchain->queue);
+    result = vulkanWrapper.vkQueueSubmit(swapchain->queue, 1, &submitInfo, swapchainImage->presentFence);
+    if (result != VK_SUCCESS) return result;
+
+    result = vulkanWrapper.vkWaitForFences(device, 1, &swapchainImage->presentFence, VK_TRUE, UINT64_MAX);
     if (result != VK_SUCCESS) return result;
 
     if (!(swapchainImage->readbackMemoryFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
@@ -637,12 +849,22 @@ static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex
 }
 #endif
 
+#ifdef VORTEK_CLI_X11
+VkResult XWindowSwapchain_presentImageWithWaits(XWindowSwapchain* swapchain, uint32_t imageIndex,
+                                                uint32_t waitSemaphoreCount, const VkSemaphore* waitSemaphores) {
+    if (!swapchain) return VK_ERROR_SURFACE_LOST_KHR;
+    if (waitSemaphoreCount > 0 && !waitSemaphores) return VK_ERROR_INITIALIZATION_FAILED;
+    if (XWindowSwapchain_hasWindowProvider(swapchain->jmethods)) return VK_ERROR_INITIALIZATION_FAILED;
+    return presentX11Image(swapchain, imageIndex, waitSemaphoreCount, waitSemaphores);
+}
+#endif
+
 VkResult XWindowSwapchain_presentImage(XWindowSwapchain* swapchain, uint32_t imageIndex) {
     if (!swapchain) return VK_ERROR_SURFACE_LOST_KHR;
 
     if (!XWindowSwapchain_hasWindowProvider(swapchain->jmethods)) {
 #ifdef VORTEK_CLI_X11
-        return presentX11Image(swapchain, imageIndex);
+        return presentX11Image(swapchain, imageIndex, 0, NULL);
 #else
         return VK_ERROR_SURFACE_LOST_KHR;
 #endif
