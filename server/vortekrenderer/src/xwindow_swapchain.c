@@ -19,8 +19,6 @@
 /* Termux:X11 private DRI3 modifier: the only plane FD is an AHB socket. */
 #define TERMUX_X11_AHARDWAREBUFFER_SOCKET_MODIFIER UINT64_C(1255)
 #define TERMUX_X11_AHARDWAREBUFFER_HANDSHAKE_TIMEOUT_MS 5000
-/* Android's public NDK header does not expose this HAL format constant. */
-#define AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM 5
 
 #if defined(__aarch64__) || defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -299,8 +297,7 @@ static bool createX11Image(XWindowSwapchain* swapchain) {
 }
 
 static bool isDri3FormatSupported(VkFormat format) {
-    return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB ||
-           format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB;
+    return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
 }
 
 static bool xcbRequestSucceeded(xcb_connection_t* connection, xcb_void_cookie_t cookie) {
@@ -574,11 +571,9 @@ static bool getDri3HardwareBufferFormat(VkFormat imageFormat, uint32_t* ahbForma
     switch (imageFormat) {
         case VK_FORMAT_B8G8R8A8_UNORM:
         case VK_FORMAT_B8G8R8A8_SRGB:
-            *ahbFormat = AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM;
-            *vkFormat = VK_FORMAT_B8G8R8A8_UNORM;
-            return true;
-        case VK_FORMAT_R8G8B8A8_UNORM:
-        case VK_FORMAT_R8G8B8A8_SRGB:
+            /* Termux:X11 exposes an ARGB8888 pixmap and applies the required
+             * channel swap when its imported AHB is RGBA. Keep the presentation
+             * buffer RGBA so BGRA swapchains use that well-tested copy path. */
             *ahbFormat = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
             *vkFormat = VK_FORMAT_R8G8B8A8_UNORM;
             return true;
