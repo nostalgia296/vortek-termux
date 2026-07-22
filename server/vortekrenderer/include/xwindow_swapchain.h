@@ -67,6 +67,7 @@ typedef struct XWindowSwapchain {
     uint8_t x11Depth;
     uint8_t x11Bpp;
     uint8_t xcbPresentOpcode;
+    int dri3PresentMode;
     void* xcbConnection;
     uint32_t xcbPresentEvent;
 #endif
