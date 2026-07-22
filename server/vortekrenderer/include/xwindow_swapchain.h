@@ -10,6 +10,7 @@ typedef struct XWindowSwapchain_Image {
     VkDeviceMemory memory;
 #ifdef VORTEK_CLI_X11
     bool acquired;
+    bool presentQueued;
     VkCommandBuffer commandBuffer;
     VkFence presentFence;
     VkBuffer readbackBuffer;
@@ -32,6 +33,17 @@ typedef struct XWindowSwapchain {
     VkDevice device;
     VkCommandPool commandPool;
     uint32_t nextImageIndex;
+    pthread_mutex_t presentMutex;
+    pthread_cond_t presentCond;
+    pthread_cond_t imageAvailableCond;
+    pthread_t presentThread;
+    bool presentSyncInitialized;
+    bool presentThreadRunning;
+    bool presentThreadStop;
+    uint32_t* presentQueue;
+    int presentQueueHead;
+    int presentQueueCount;
+    VkResult presentStatus;
     void* x11Display;
     void* x11Image;
     void* x11GC;

@@ -5,8 +5,10 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XShm.h>
+#include <errno.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
+#include <time.h>
 
 #if defined(__aarch64__) || defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -17,6 +19,11 @@ static bool globalX11DisplayChecked = false;
 static pthread_mutex_t globalX11Mutex = PTHREAD_MUTEX_INITIALIZER;
 static int globalX11ErrorCode = 0;
 static int (*globalPreviousX11ErrorHandler)(Display*, XErrorEvent*) = NULL;
+
+static VkResult startCliPresentThread(XWindowSwapchain* swapchain);
+static void stopCliPresentThread(XWindowSwapchain* swapchain);
+static void* cliPresentThreadMain(void* param);
+static void releaseCliImage(XWindowSwapchain* swapchain, uint32_t imageIndex);
 
 static int handleX11Error(Display* display, XErrorEvent* event) {
     (void)display;
@@ -507,6 +514,9 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, uint32_t graphicsQueu
     if (useX11Backend && swapchain->imageCount < getSurfaceMinImageCount()) {
         swapchain->imageCount = getSurfaceMinImageCount();
     }
+    if (useX11Backend && swapchain->imageCount > 3) {
+        swapchain->imageCount = 3;
+    }
 #endif
     swapchain->images = calloc(swapchain->imageCount, sizeof(XWindowSwapchain_Image));
     if (!swapchain->images) goto error;
@@ -539,6 +549,12 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, uint32_t graphicsQueu
     }
 
     vulkanWrapper.vkGetDeviceQueue(device, graphicsQueueIndex, 0, &swapchain->queue);
+#ifdef VORTEK_CLI_X11
+    if (useX11Backend) {
+        result = startCliPresentThread(swapchain);
+        if (result != VK_SUCCESS) goto error;
+    }
+#endif
     return swapchain;
 
 error:
@@ -548,6 +564,9 @@ error:
 
 void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain) {
     if (!swapchain) return;
+#ifdef VORTEK_CLI_X11
+    stopCliPresentThread(swapchain);
+#endif
     for (int i = 0; i < swapchain->imageCount; i++) {
 #ifdef VORTEK_CLI_X11
         if (swapchain->images[i].presentFence) vulkanWrapper.vkDestroyFence(device, swapchain->images[i].presentFence, NULL);
@@ -587,30 +606,74 @@ VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t
             return VK_ERROR_SURFACE_LOST_KHR;
         }
 
-        for (int i = 0; i < swapchain->imageCount; i++) {
-            uint32_t candidate = (swapchain->nextImageIndex + (uint32_t)i) % (uint32_t)swapchain->imageCount;
-            if (swapchain->images[candidate].acquired) continue;
-
-            if (signalSemaphore || fence) {
-                VkSubmitInfo submitInfo = {0};
-                submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-                if (signalSemaphore) {
-                    submitInfo.pSignalSemaphores = &signalSemaphore;
-                    submitInfo.signalSemaphoreCount = 1;
-                }
-
-                VkResult submitResult = vulkanWrapper.vkQueueSubmit(swapchain->queue, 1, &submitInfo, fence);
-                if (submitResult == VK_ERROR_DEVICE_LOST) return submitResult;
-                if (submitResult != VK_SUCCESS) return submitResult;
+        struct timespec deadline = {0};
+        bool useDeadline = timeout != 0 && timeout != UINT64_MAX;
+        if (useDeadline) {
+            clock_gettime(CLOCK_REALTIME, &deadline);
+            uint64_t seconds = timeout / 1000000000ULL;
+            uint64_t nanos = timeout % 1000000000ULL;
+            if (seconds > 0x3fffffffULL) seconds = 0x3fffffffULL;
+            deadline.tv_sec += (time_t)seconds;
+            deadline.tv_nsec += (long)nanos;
+            if (deadline.tv_nsec >= 1000000000L) {
+                deadline.tv_sec += 1;
+                deadline.tv_nsec -= 1000000000L;
             }
-
-            swapchain->images[candidate].acquired = true;
-            swapchain->nextImageIndex = (candidate + 1) % (uint32_t)swapchain->imageCount;
-            *imageIndex = candidate;
-            return VK_SUCCESS;
         }
 
-        return timeout == 0 ? VK_NOT_READY : VK_TIMEOUT;
+        pthread_mutex_lock(&swapchain->presentMutex);
+        while (true) {
+            if (swapchain->presentStatus != VK_SUCCESS) {
+                VkResult result = swapchain->presentStatus;
+                pthread_mutex_unlock(&swapchain->presentMutex);
+                return result;
+            }
+
+            for (int i = 0; i < swapchain->imageCount; i++) {
+                uint32_t candidate = (swapchain->nextImageIndex + (uint32_t)i) % (uint32_t)swapchain->imageCount;
+                if (swapchain->images[candidate].acquired) continue;
+
+                swapchain->images[candidate].acquired = true;
+                swapchain->images[candidate].presentQueued = false;
+                swapchain->nextImageIndex = (candidate + 1) % (uint32_t)swapchain->imageCount;
+                *imageIndex = candidate;
+                pthread_mutex_unlock(&swapchain->presentMutex);
+
+                if (signalSemaphore || fence) {
+                    VkSubmitInfo submitInfo = {0};
+                    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                    if (signalSemaphore) {
+                        submitInfo.pSignalSemaphores = &signalSemaphore;
+                        submitInfo.signalSemaphoreCount = 1;
+                    }
+
+                    VkResult submitResult = vulkanWrapper.vkQueueSubmit(swapchain->queue, 1, &submitInfo, fence);
+                    if (submitResult != VK_SUCCESS) {
+                        releaseCliImage(swapchain, *imageIndex);
+                        return submitResult;
+                    }
+                }
+
+                return VK_SUCCESS;
+            }
+
+            if (timeout == 0) {
+                pthread_mutex_unlock(&swapchain->presentMutex);
+                return VK_NOT_READY;
+            }
+
+            int waitResult = timeout == UINT64_MAX ?
+                             pthread_cond_wait(&swapchain->imageAvailableCond, &swapchain->presentMutex) :
+                             pthread_cond_timedwait(&swapchain->imageAvailableCond, &swapchain->presentMutex, &deadline);
+            if (waitResult == ETIMEDOUT) {
+                pthread_mutex_unlock(&swapchain->presentMutex);
+                return VK_TIMEOUT;
+            }
+            if (waitResult != 0) {
+                pthread_mutex_unlock(&swapchain->presentMutex);
+                return VK_ERROR_INITIALIZATION_FAILED;
+            }
+        }
     }
 #endif
 
@@ -808,6 +871,160 @@ static bool uploadReadbackToX11(XWindowSwapchain* swapchain, XWindowSwapchain_Im
     return submitted && x11Succeeded;
 }
 
+static void releaseCliImageLocked(XWindowSwapchain* swapchain, uint32_t imageIndex) {
+    if (!swapchain || imageIndex >= (uint32_t)swapchain->imageCount) return;
+
+    swapchain->images[imageIndex].acquired = false;
+    swapchain->images[imageIndex].presentQueued = false;
+    pthread_cond_signal(&swapchain->imageAvailableCond);
+}
+
+static void releaseCliImage(XWindowSwapchain* swapchain, uint32_t imageIndex) {
+    if (!swapchain || imageIndex >= (uint32_t)swapchain->imageCount) return;
+    if (!swapchain->presentSyncInitialized) {
+        swapchain->images[imageIndex].acquired = false;
+        swapchain->images[imageIndex].presentQueued = false;
+        return;
+    }
+
+    pthread_mutex_lock(&swapchain->presentMutex);
+    releaseCliImageLocked(swapchain, imageIndex);
+    pthread_mutex_unlock(&swapchain->presentMutex);
+}
+
+static VkResult getCliPresentStatus(XWindowSwapchain* swapchain, uint32_t imageIndex) {
+    VkResult status = VK_SUCCESS;
+
+    pthread_mutex_lock(&swapchain->presentMutex);
+    if (swapchain->presentStatus != VK_SUCCESS) status = swapchain->presentStatus;
+    else if (imageIndex >= (uint32_t)swapchain->imageCount) status = VK_ERROR_SURFACE_LOST_KHR;
+    else if (!swapchain->images[imageIndex].acquired || swapchain->images[imageIndex].presentQueued) status = VK_NOT_READY;
+    pthread_mutex_unlock(&swapchain->presentMutex);
+
+    return status;
+}
+
+static VkResult enqueueCliPresentImage(XWindowSwapchain* swapchain, uint32_t imageIndex) {
+    pthread_mutex_lock(&swapchain->presentMutex);
+
+    VkResult result = VK_SUCCESS;
+    if (swapchain->presentStatus != VK_SUCCESS) result = swapchain->presentStatus;
+    else if (imageIndex >= (uint32_t)swapchain->imageCount) result = VK_ERROR_SURFACE_LOST_KHR;
+    else if (!swapchain->images[imageIndex].acquired || swapchain->images[imageIndex].presentQueued) result = VK_NOT_READY;
+    else if (swapchain->presentQueueCount >= swapchain->imageCount) result = VK_NOT_READY;
+    else {
+        int queueIndex = (swapchain->presentQueueHead + swapchain->presentQueueCount) % swapchain->imageCount;
+        swapchain->presentQueue[queueIndex] = imageIndex;
+        swapchain->presentQueueCount++;
+        swapchain->images[imageIndex].presentQueued = true;
+        pthread_cond_signal(&swapchain->presentCond);
+    }
+
+    pthread_mutex_unlock(&swapchain->presentMutex);
+    return result;
+}
+
+static VkResult finishCliPresentImage(XWindowSwapchain* swapchain, uint32_t imageIndex) {
+    if (!swapchain || imageIndex >= (uint32_t)swapchain->imageCount) return VK_ERROR_SURFACE_LOST_KHR;
+
+    XWindowSwapchain_Image* swapchainImage = &swapchain->images[imageIndex];
+    VkDeviceSize bufferSize = (VkDeviceSize)swapchain->imageExtent.width * swapchain->imageExtent.height * 4;
+
+    VkResult result = vulkanWrapper.vkWaitForFences(swapchain->device, 1, &swapchainImage->presentFence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS) return result;
+
+    if (!(swapchainImage->readbackMemoryFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+        VkMappedMemoryRange range = {0};
+        range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        range.memory = swapchainImage->readbackMemory;
+        range.offset = 0;
+        range.size = bufferSize;
+        result = vulkanWrapper.vkInvalidateMappedMemoryRanges(swapchain->device, 1, &range);
+        if (result != VK_SUCCESS) return result;
+    }
+
+    return uploadReadbackToX11(swapchain, swapchainImage) ? VK_SUCCESS : VK_ERROR_SURFACE_LOST_KHR;
+}
+
+static void* cliPresentThreadMain(void* param) {
+    XWindowSwapchain* swapchain = param;
+
+    while (true) {
+        pthread_mutex_lock(&swapchain->presentMutex);
+        while (swapchain->presentQueueCount == 0 && !swapchain->presentThreadStop) {
+            pthread_cond_wait(&swapchain->presentCond, &swapchain->presentMutex);
+        }
+
+        if (swapchain->presentQueueCount == 0 && swapchain->presentThreadStop) {
+            pthread_mutex_unlock(&swapchain->presentMutex);
+            break;
+        }
+
+        uint32_t imageIndex = swapchain->presentQueue[swapchain->presentQueueHead];
+        swapchain->presentQueueHead = (swapchain->presentQueueHead + 1) % swapchain->imageCount;
+        swapchain->presentQueueCount--;
+        pthread_mutex_unlock(&swapchain->presentMutex);
+
+        VkResult result = finishCliPresentImage(swapchain, imageIndex);
+
+        pthread_mutex_lock(&swapchain->presentMutex);
+        if (result != VK_SUCCESS && swapchain->presentStatus == VK_SUCCESS) {
+            swapchain->presentStatus = result;
+        }
+        releaseCliImageLocked(swapchain, imageIndex);
+        pthread_mutex_unlock(&swapchain->presentMutex);
+    }
+
+    return NULL;
+}
+
+static VkResult startCliPresentThread(XWindowSwapchain* swapchain) {
+    swapchain->presentQueue = calloc(swapchain->imageCount, sizeof(uint32_t));
+    if (!swapchain->presentQueue) return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    if (pthread_mutex_init(&swapchain->presentMutex, NULL) != 0) goto error_free_queue;
+    if (pthread_cond_init(&swapchain->presentCond, NULL) != 0) goto error_destroy_mutex;
+    if (pthread_cond_init(&swapchain->imageAvailableCond, NULL) != 0) goto error_destroy_present_cond;
+
+    swapchain->presentStatus = VK_SUCCESS;
+    swapchain->presentSyncInitialized = true;
+    if (pthread_create(&swapchain->presentThread, NULL, cliPresentThreadMain, swapchain) != 0) goto error_destroy_image_cond;
+
+    swapchain->presentThreadRunning = true;
+    return VK_SUCCESS;
+
+error_destroy_image_cond:
+    swapchain->presentSyncInitialized = false;
+    pthread_cond_destroy(&swapchain->imageAvailableCond);
+error_destroy_present_cond:
+    pthread_cond_destroy(&swapchain->presentCond);
+error_destroy_mutex:
+    pthread_mutex_destroy(&swapchain->presentMutex);
+error_free_queue:
+    MEMFREE(swapchain->presentQueue);
+    return VK_ERROR_INITIALIZATION_FAILED;
+}
+
+static void stopCliPresentThread(XWindowSwapchain* swapchain) {
+    if (!swapchain || !swapchain->presentSyncInitialized) return;
+
+    pthread_mutex_lock(&swapchain->presentMutex);
+    swapchain->presentThreadStop = true;
+    pthread_cond_signal(&swapchain->presentCond);
+    pthread_mutex_unlock(&swapchain->presentMutex);
+
+    if (swapchain->presentThreadRunning) {
+        pthread_join(swapchain->presentThread, NULL);
+        swapchain->presentThreadRunning = false;
+    }
+
+    pthread_cond_destroy(&swapchain->imageAvailableCond);
+    pthread_cond_destroy(&swapchain->presentCond);
+    pthread_mutex_destroy(&swapchain->presentMutex);
+    MEMFREE(swapchain->presentQueue);
+    swapchain->presentSyncInitialized = false;
+}
+
 static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex,
                                 uint32_t waitSemaphoreCount, const VkSemaphore* waitSemaphores) {
     if (!swapchain->x11Display || imageIndex >= (uint32_t)swapchain->imageCount) {
@@ -817,9 +1034,11 @@ static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex
     XWindowSwapchain_Image* swapchainImage = &swapchain->images[imageIndex];
     if (!swapchainImage->commandBuffer || !swapchainImage->presentFence) return VK_ERROR_INITIALIZATION_FAILED;
 
+    VkResult presentStatus = getCliPresentStatus(swapchain, imageIndex);
+    if (presentStatus != VK_SUCCESS) return presentStatus;
+
     VkDevice device = swapchain->device;
     VkCommandBuffer commandBuffer = swapchainImage->commandBuffer;
-    VkDeviceSize bufferSize = (VkDeviceSize)swapchain->imageExtent.width * swapchain->imageExtent.height * 4;
 
     VkResult result = vulkanWrapper.vkResetCommandBuffer(commandBuffer, 0);
     if (result != VK_SUCCESS) return result;
@@ -890,24 +1109,13 @@ static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex
     result = vulkanWrapper.vkQueueSubmit(swapchain->queue, 1, &submitInfo, swapchainImage->presentFence);
     if (result != VK_SUCCESS) return result;
 
-    result = vulkanWrapper.vkWaitForFences(device, 1, &swapchainImage->presentFence, VK_TRUE, UINT64_MAX);
-    if (result != VK_SUCCESS) return result;
-
-    if (!(swapchainImage->readbackMemoryFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-        VkMappedMemoryRange range = {0};
-        range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-        range.memory = swapchainImage->readbackMemory;
-        range.offset = 0;
-        range.size = bufferSize;
-        vulkanWrapper.vkInvalidateMappedMemoryRanges(device, 1, &range);
+    result = enqueueCliPresentImage(swapchain, imageIndex);
+    if (result != VK_SUCCESS) {
+        (void)finishCliPresentImage(swapchain, imageIndex);
+        return result;
     }
 
-    return uploadReadbackToX11(swapchain, swapchainImage) ? VK_SUCCESS : VK_ERROR_SURFACE_LOST_KHR;
-}
-
-static void releaseCliImage(XWindowSwapchain* swapchain, uint32_t imageIndex) {
-    if (!swapchain || imageIndex >= (uint32_t)swapchain->imageCount) return;
-    swapchain->images[imageIndex].acquired = false;
+    return VK_SUCCESS;
 }
 #endif
 
@@ -918,7 +1126,7 @@ VkResult XWindowSwapchain_presentImageWithWaits(XWindowSwapchain* swapchain, uin
     if (waitSemaphoreCount > 0 && !waitSemaphores) return VK_ERROR_INITIALIZATION_FAILED;
     if (XWindowSwapchain_hasWindowProvider(swapchain->jmethods)) return VK_ERROR_INITIALIZATION_FAILED;
     VkResult result = presentX11Image(swapchain, imageIndex, waitSemaphoreCount, waitSemaphores);
-    releaseCliImage(swapchain, imageIndex);
+    if (result != VK_SUCCESS) releaseCliImage(swapchain, imageIndex);
     return result;
 }
 #endif
@@ -929,7 +1137,7 @@ VkResult XWindowSwapchain_presentImage(XWindowSwapchain* swapchain, uint32_t ima
     if (!XWindowSwapchain_hasWindowProvider(swapchain->jmethods)) {
 #ifdef VORTEK_CLI_X11
         VkResult result = presentX11Image(swapchain, imageIndex, 0, NULL);
-        releaseCliImage(swapchain, imageIndex);
+        if (result != VK_SUCCESS) releaseCliImage(swapchain, imageIndex);
         return result;
 #else
         return VK_ERROR_SURFACE_LOST_KHR;
