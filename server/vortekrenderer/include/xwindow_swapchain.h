@@ -13,6 +13,8 @@ typedef struct XWindowSwapchain_Image {
     bool presentQueued;
     VkCommandBuffer commandBuffer;
     VkFence presentFence;
+    uint32_t xcbPixmap;
+    uint32_t presentSerial;
     VkBuffer readbackBuffer;
     VkDeviceMemory readbackMemory;
     void* readbackData;
@@ -40,9 +42,12 @@ typedef struct XWindowSwapchain {
     bool presentSyncInitialized;
     bool presentThreadRunning;
     bool presentThreadStop;
+    bool useDri3;
     uint32_t* presentQueue;
     int presentQueueHead;
     int presentQueueCount;
+    uint32_t presentPendingCount;
+    uint32_t presentSerial;
     VkResult presentStatus;
     void* x11Display;
     void* x11Image;
@@ -51,6 +56,11 @@ typedef struct XWindowSwapchain {
     unsigned long x11Window;
     VkExtent2D x11WindowExtent;
     bool x11WindowLost;
+    uint8_t x11Depth;
+    uint8_t x11Bpp;
+    uint8_t xcbPresentOpcode;
+    void* xcbConnection;
+    uint32_t xcbPresentEvent;
 #endif
 } XWindowSwapchain;
 

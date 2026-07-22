@@ -5,6 +5,9 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XShm.h>
+#include <xcb/xcb.h>
+#include <xcb/dri3.h>
+#include <xcb/present.h>
 #include <errno.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
@@ -24,6 +27,8 @@ static VkResult startCliPresentThread(XWindowSwapchain* swapchain);
 static void stopCliPresentThread(XWindowSwapchain* swapchain);
 static void* cliPresentThreadMain(void* param);
 static void releaseCliImage(XWindowSwapchain* swapchain, uint32_t imageIndex);
+static void destroyCliImage(VkDevice device, XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage);
+static void destroyCliCommandResources(VkDevice device, XWindowSwapchain* swapchain);
 
 static int handleX11Error(Display* display, XErrorEvent* event) {
     (void)display;
@@ -125,6 +130,12 @@ static int maskBits(unsigned long mask) {
 static bool isX11ShmEnabled() {
     const char* value = getenv("VORTEK_CLI_X11_SHM");
     return !value || !value[0] || strcmp(value, "0") != 0;
+}
+
+static bool isX11Dri3Enabled() {
+    const char* value = getenv("VORTEK_CLI_X11_DRI3");
+    return (!value || !value[0] || strcmp(value, "0") != 0) &&
+           (vulkanWrapper.vkGetMemoryFd != NULL);
 }
 
 static void destroyX11Image(Display* display, XImage* image, XShmSegmentInfo* shmInfo) {
@@ -263,6 +274,112 @@ static bool createX11Image(XWindowSwapchain* swapchain) {
     swapchain->x11WindowExtent.width = (uint32_t)attrs.width;
     swapchain->x11WindowExtent.height = (uint32_t)attrs.height;
     return true;
+}
+
+static bool isDri3FormatSupported(VkFormat format) {
+    return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+}
+
+static bool xcbRequestSucceeded(xcb_connection_t* connection, xcb_void_cookie_t cookie) {
+    xcb_generic_error_t* error = xcb_request_check(connection, cookie);
+    if (!error) return true;
+
+    free(error);
+    return false;
+}
+
+static void destroyXcbDri3State(XWindowSwapchain* swapchain) {
+    xcb_connection_t* connection = (xcb_connection_t*)swapchain->xcbConnection;
+    if (!connection) return;
+
+    if (swapchain->xcbPresentEvent) {
+        xcb_present_select_input(connection, swapchain->xcbPresentEvent,
+                                 (xcb_window_t)swapchain->x11Window,
+                                 XCB_PRESENT_EVENT_MASK_NO_EVENT);
+        xcb_flush(connection);
+    }
+    xcb_disconnect(connection);
+    swapchain->xcbConnection = NULL;
+    swapchain->xcbPresentEvent = 0;
+    swapchain->xcbPresentOpcode = 0;
+    swapchain->useDri3 = false;
+}
+
+static bool createXcbDri3State(XWindowSwapchain* swapchain) {
+    if (!isX11Dri3Enabled() || !isDri3FormatSupported(swapchain->imageFormat)) return false;
+    if (swapchain->imageExtent.width > UINT16_MAX || swapchain->imageExtent.height > UINT16_MAX) return false;
+
+    Display* display = getX11Display();
+    if (!display || swapchain->windowId == 0) return false;
+
+    XWindowAttributes attrs = {0};
+    beginX11ErrorTrap(display);
+    Status status = XGetWindowAttributes(display, (Window)swapchain->windowId, &attrs);
+    bool x11Success = endX11ErrorTrap(display);
+    if (!x11Success || !status || attrs.width <= 0 || attrs.height <= 0 ||
+        (attrs.depth != 24 && attrs.depth != 32)) {
+        return false;
+    }
+    if (swapchain->imageExtent.width != (uint32_t)attrs.width ||
+        swapchain->imageExtent.height != (uint32_t)attrs.height) {
+        return false;
+    }
+
+    beginX11ErrorTrap(display);
+    XSelectInput(display, (Window)swapchain->windowId, attrs.your_event_mask | StructureNotifyMask);
+    bool selectSuccess = endX11ErrorTrap(display);
+    if (!selectSuccess) return false;
+
+    int screenNumber = 0;
+    xcb_connection_t* connection = xcb_connect(NULL, &screenNumber);
+    if (!connection || xcb_connection_has_error(connection)) {
+        if (connection) xcb_disconnect(connection);
+        return false;
+    }
+
+    const xcb_query_extension_reply_t* dri3Extension = xcb_get_extension_data(connection, &xcb_dri3_id);
+    const xcb_query_extension_reply_t* presentExtension = xcb_get_extension_data(connection, &xcb_present_id);
+    if (!dri3Extension || !dri3Extension->present || !presentExtension || !presentExtension->present) goto error;
+
+    xcb_generic_error_t* errorReply = NULL;
+    xcb_dri3_query_version_reply_t* dri3Version = xcb_dri3_query_version_reply(
+        connection, xcb_dri3_query_version(connection, 1, 2), &errorReply);
+    bool hasDri3Buffers = !errorReply && dri3Version &&
+                          (dri3Version->major_version > 1 ||
+                           (dri3Version->major_version == 1 && dri3Version->minor_version >= 2));
+    free(errorReply);
+    free(dri3Version);
+    if (!hasDri3Buffers) goto error;
+
+    errorReply = NULL;
+    xcb_present_query_version_reply_t* presentVersion = xcb_present_query_version_reply(
+        connection, xcb_present_query_version(connection, 1, 0), &errorReply);
+    bool hasPresent = !errorReply && presentVersion && presentVersion->major_version >= 1;
+    free(errorReply);
+    free(presentVersion);
+    if (!hasPresent) goto error;
+
+    xcb_present_event_t presentEvent = xcb_generate_id(connection);
+    xcb_void_cookie_t selectCookie = xcb_present_select_input_checked(
+        connection, presentEvent, (xcb_window_t)swapchain->windowId,
+        XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY | XCB_PRESENT_EVENT_MASK_IDLE_NOTIFY);
+    if (!xcbRequestSucceeded(connection, selectCookie)) goto error;
+
+    swapchain->x11Display = display;
+    swapchain->x11Window = (Window)swapchain->windowId;
+    swapchain->x11WindowExtent.width = (uint32_t)attrs.width;
+    swapchain->x11WindowExtent.height = (uint32_t)attrs.height;
+    swapchain->x11Depth = (uint8_t)attrs.depth;
+    swapchain->x11Bpp = 32;
+    swapchain->xcbConnection = connection;
+    swapchain->xcbPresentEvent = presentEvent;
+    swapchain->xcbPresentOpcode = presentExtension->major_opcode;
+    swapchain->useDri3 = true;
+    return true;
+
+error:
+    xcb_disconnect(connection);
+    return false;
 }
 #endif
 
@@ -424,6 +541,81 @@ static VkResult createDeviceLocalImageMemory(VkDevice device, VkImage image, VkD
     return VK_SUCCESS;
 }
 
+static VkResult createExportableImageMemory(VkDevice device, VkImage image, VkDeviceMemory* pMemory) {
+    VkMemoryRequirements memReqs = {0};
+    vulkanWrapper.vkGetImageMemoryRequirements(device, image, &memReqs);
+
+    VkExportMemoryAllocateInfo exportInfo = {0};
+    exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+    VkMemoryDedicatedAllocateInfo dedicatedInfo = {0};
+    dedicatedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
+    dedicatedInfo.pNext = &exportInfo;
+    dedicatedInfo.image = image;
+
+    VkMemoryAllocateInfo memoryInfo = {0};
+    memoryInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    memoryInfo.pNext = &dedicatedInfo;
+    memoryInfo.allocationSize = memReqs.size;
+    memoryInfo.memoryTypeIndex = getMemoryTypeIndex(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    VkResult result = vulkanWrapper.vkAllocateMemory(device, &memoryInfo, NULL, &memory);
+    if (result != VK_SUCCESS) return result;
+
+    result = vulkanWrapper.vkBindImageMemory(device, image, memory, 0);
+    if (result != VK_SUCCESS) {
+        vulkanWrapper.vkFreeMemory(device, memory, NULL);
+        return result;
+    }
+
+    *pMemory = memory;
+    return VK_SUCCESS;
+}
+
+static VkResult createDri3Pixmap(VkDevice device, XWindowSwapchain* swapchain,
+                                 XWindowSwapchain_Image* swapchainImage) {
+    VkImageSubresource subresource = {0};
+    subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+
+    VkSubresourceLayout layout = {0};
+    vulkanWrapper.vkGetImageSubresourceLayout(device, swapchainImage->image, &subresource, &layout);
+    VkDeviceSize minimumRowPitch = (VkDeviceSize)swapchain->imageExtent.width * 4;
+    if (layout.rowPitch < minimumRowPitch || layout.rowPitch > UINT32_MAX || layout.offset > UINT32_MAX) {
+        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+
+    VkMemoryGetFdInfoKHR getFdInfo = {0};
+    getFdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+    getFdInfo.memory = swapchainImage->memory;
+    getFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+
+    int fd = -1;
+    VkResult result = vulkanWrapper.vkGetMemoryFd(device, &getFdInfo, &fd);
+    if (result != VK_SUCCESS || fd < 0) {
+        if (fd >= 0) close(fd);
+        return result == VK_SUCCESS ? VK_ERROR_INVALID_EXTERNAL_HANDLE : result;
+    }
+
+    xcb_connection_t* connection = (xcb_connection_t*)swapchain->xcbConnection;
+    xcb_pixmap_t pixmap = xcb_generate_id(connection);
+    int32_t buffers[] = {fd};
+    /* libxcb owns and closes fds after the request is queued. */
+    xcb_void_cookie_t cookie = xcb_dri3_pixmap_from_buffers_checked(
+        connection, pixmap, (xcb_window_t)swapchain->x11Window, 1,
+        (uint16_t)swapchain->imageExtent.width, (uint16_t)swapchain->imageExtent.height,
+        (uint32_t)layout.rowPitch, (uint32_t)layout.offset,
+        0, 0, 0, 0, 0, 0,
+        swapchain->x11Depth, swapchain->x11Bpp, 0, buffers);
+    xcb_flush(connection);
+    bool pixmapCreated = xcbRequestSucceeded(connection, cookie);
+    if (!pixmapCreated) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+    swapchainImage->xcbPixmap = pixmap;
+    return VK_SUCCESS;
+}
+
 static VkResult createReadbackBuffer(VkDevice device, XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage) {
     VkDeviceSize bufferSize = (VkDeviceSize)swapchain->imageExtent.width * swapchain->imageExtent.height * 4;
 
@@ -457,8 +649,15 @@ static VkResult createReadbackBuffer(VkDevice device, XWindowSwapchain* swapchai
 }
 
 static VkResult createCliImage(VkDevice device, XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage) {
+    VkExternalMemoryImageCreateInfo externalInfo = {0};
+    if (swapchain->useDri3) {
+        externalInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+        externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+    }
+
     VkImageCreateInfo imageInfo = {0};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.pNext = swapchain->useDri3 ? &externalInfo : NULL;
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
     imageInfo.format = swapchain->imageFormat;
     imageInfo.extent.width = swapchain->imageExtent.width;
@@ -467,18 +666,22 @@ static VkResult createCliImage(VkDevice device, XWindowSwapchain* swapchain, XWi
     imageInfo.mipLevels = 1;
     imageInfo.arrayLayers = 1;
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
-    imageInfo.usage = swapchain->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    imageInfo.tiling = swapchain->useDri3 ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = swapchain->imageUsage |
+                      (swapchain->useDri3 ? 0 : VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VkResult result = vulkanWrapper.vkCreateImage(device, &imageInfo, NULL, &swapchainImage->image);
     if (result != VK_SUCCESS) return result;
 
-    result = createDeviceLocalImageMemory(device, swapchainImage->image, &swapchainImage->memory);
+    result = swapchain->useDri3 ?
+             createExportableImageMemory(device, swapchainImage->image, &swapchainImage->memory) :
+             createDeviceLocalImageMemory(device, swapchainImage->image, &swapchainImage->memory);
     if (result != VK_SUCCESS) return result;
 
-    return createReadbackBuffer(device, swapchain, swapchainImage);
+    return swapchain->useDri3 ? createDri3Pixmap(device, swapchain, swapchainImage) :
+                               createReadbackBuffer(device, swapchain, swapchainImage);
 }
 
 static VkResult createCliCommandResources(VkDevice device, uint32_t graphicsQueueIndex, XWindowSwapchain* swapchain) {
@@ -507,6 +710,45 @@ static VkResult createCliCommandResources(VkDevice device, uint32_t graphicsQueu
     }
 
     return VK_SUCCESS;
+}
+
+static void destroyCliImage(VkDevice device, XWindowSwapchain* swapchain,
+                            XWindowSwapchain_Image* swapchainImage) {
+    if (swapchainImage->xcbPixmap && swapchain->xcbConnection) {
+        xcb_connection_t* connection = (xcb_connection_t*)swapchain->xcbConnection;
+        xcb_void_cookie_t cookie = xcb_free_pixmap_checked(connection, swapchainImage->xcbPixmap);
+        xcb_flush(connection);
+        (void)xcbRequestSucceeded(connection, cookie);
+    }
+    if (swapchainImage->readbackData) vulkanWrapper.vkUnmapMemory(device, swapchainImage->readbackMemory);
+    if (swapchainImage->readbackBuffer) vulkanWrapper.vkDestroyBuffer(device, swapchainImage->readbackBuffer, NULL);
+    if (swapchainImage->readbackMemory) vulkanWrapper.vkFreeMemory(device, swapchainImage->readbackMemory, NULL);
+    if (swapchainImage->image) vulkanWrapper.vkDestroyImage(device, swapchainImage->image, NULL);
+    if (swapchainImage->memory) vulkanWrapper.vkFreeMemory(device, swapchainImage->memory, NULL);
+
+    swapchainImage->xcbPixmap = 0;
+    swapchainImage->readbackData = NULL;
+    swapchainImage->readbackBuffer = VK_NULL_HANDLE;
+    swapchainImage->readbackMemory = VK_NULL_HANDLE;
+    swapchainImage->readbackMemoryFlags = 0;
+    swapchainImage->image = VK_NULL_HANDLE;
+    swapchainImage->memory = VK_NULL_HANDLE;
+}
+
+static void destroyCliCommandResources(VkDevice device, XWindowSwapchain* swapchain) {
+    if (swapchain->images) {
+        for (int i = 0; i < swapchain->imageCount; i++) {
+            if (swapchain->images[i].presentFence) {
+                vulkanWrapper.vkDestroyFence(device, swapchain->images[i].presentFence, NULL);
+                swapchain->images[i].presentFence = VK_NULL_HANDLE;
+            }
+            swapchain->images[i].commandBuffer = VK_NULL_HANDLE;
+        }
+    }
+    if (swapchain->commandPool) {
+        vulkanWrapper.vkDestroyCommandPool(device, swapchain->commandPool, NULL);
+        swapchain->commandPool = VK_NULL_HANDLE;
+    }
 }
 #endif
 
@@ -537,11 +779,13 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, uint32_t graphicsQueu
     XWindowSwapchain* swapchain = calloc(1, sizeof(XWindowSwapchain));
     if (!swapchain) return NULL;
 
+    bool useX11Backend = false;
 #ifdef VORTEK_CLI_X11
-    bool useX11Backend = !XWindowSwapchain_hasWindowProvider(jmethods);
+    useX11Backend = !XWindowSwapchain_hasWindowProvider(jmethods);
 #endif
 
     swapchain->windowId = windowId;
+    swapchain->jmethods = jmethods;
     swapchain->imageCount = swapchainInfo->minImageCount;
     if (swapchain->imageCount <= 0) swapchain->imageCount = getSurfaceMinImageCount();
 #ifdef VORTEK_CLI_X11
@@ -557,29 +801,48 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, uint32_t graphicsQueu
     swapchain->imageFormat = swapchainInfo->imageFormat;
     swapchain->imageUsage = swapchainInfo->imageUsage;
     memcpy(&swapchain->imageExtent, &swapchainInfo->imageExtent, sizeof(VkExtent2D));
-    swapchain->jmethods = jmethods;
 #ifdef VORTEK_CLI_X11
     swapchain->device = device;
 #endif
 
-    VkResult result;
+    VkResult result = VK_SUCCESS;
 #ifdef VORTEK_CLI_X11
     if (useX11Backend) {
-        if (!createX11Image(swapchain)) goto error;
+        (void)createXcbDri3State(swapchain);
+        if (!swapchain->useDri3 && !createX11Image(swapchain)) goto error;
 
         result = createCliCommandResources(device, graphicsQueueIndex, swapchain);
         if (result != VK_SUCCESS) goto error;
+
+        for (int i = 0; i < swapchain->imageCount; i++) {
+            result = createCliImage(device, swapchain, &swapchain->images[i]);
+            if (result != VK_SUCCESS) break;
+        }
+
+        if (result != VK_SUCCESS && swapchain->useDri3) {
+            for (int i = 0; i < swapchain->imageCount; i++) {
+                destroyCliImage(device, swapchain, &swapchain->images[i]);
+            }
+            destroyCliCommandResources(device, swapchain);
+            destroyXcbDri3State(swapchain);
+
+            if (!createX11Image(swapchain)) goto error;
+            result = createCliCommandResources(device, graphicsQueueIndex, swapchain);
+            if (result != VK_SUCCESS) goto error;
+            for (int i = 0; i < swapchain->imageCount; i++) {
+                result = createCliImage(device, swapchain, &swapchain->images[i]);
+                if (result != VK_SUCCESS) goto error;
+            }
+        }
+        else if (result != VK_SUCCESS) goto error;
     }
 #endif
 
-    for (int i = 0; i < swapchain->imageCount; i++) {
-#ifdef VORTEK_CLI_X11
-        result = useX11Backend ? createCliImage(device, swapchain, &swapchain->images[i]) :
-                                 createImage(device, swapchain, &swapchain->images[i]);
-#else
-        result = createImage(device, swapchain, &swapchain->images[i]);
-#endif
-        if (result != VK_SUCCESS) goto error;
+    if (!useX11Backend) {
+        for (int i = 0; i < swapchain->imageCount; i++) {
+            result = createImage(device, swapchain, &swapchain->images[i]);
+            if (result != VK_SUCCESS) goto error;
+        }
     }
 
     vulkanWrapper.vkGetDeviceQueue(device, graphicsQueueIndex, 0, &swapchain->queue);
@@ -599,21 +862,29 @@ error:
 void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain) {
     if (!swapchain) return;
 #ifdef VORTEK_CLI_X11
-    stopCliPresentThread(swapchain);
+    bool useX11Backend = !XWindowSwapchain_hasWindowProvider(swapchain->jmethods);
+    if (useX11Backend) {
+        stopCliPresentThread(swapchain);
+        if (swapchain->images) {
+            for (int i = 0; i < swapchain->imageCount; i++) {
+                destroyCliImage(device, swapchain, &swapchain->images[i]);
+            }
+        }
+        destroyCliCommandResources(device, swapchain);
+        destroyXcbDri3State(swapchain);
+    }
+    else
 #endif
-    for (int i = 0; i < swapchain->imageCount; i++) {
-#ifdef VORTEK_CLI_X11
-        if (swapchain->images[i].presentFence) vulkanWrapper.vkDestroyFence(device, swapchain->images[i].presentFence, NULL);
-        if (swapchain->images[i].readbackData) vulkanWrapper.vkUnmapMemory(device, swapchain->images[i].readbackMemory);
-        if (swapchain->images[i].readbackBuffer) vulkanWrapper.vkDestroyBuffer(device, swapchain->images[i].readbackBuffer, NULL);
-        if (swapchain->images[i].readbackMemory) vulkanWrapper.vkFreeMemory(device, swapchain->images[i].readbackMemory, NULL);
-#endif
-        if (swapchain->images[i].image) vulkanWrapper.vkDestroyImage(device, swapchain->images[i].image, NULL);
-        if (swapchain->images[i].memory) vulkanWrapper.vkFreeMemory(device, swapchain->images[i].memory, NULL);
+    {
+        if (swapchain->images) {
+            for (int i = 0; i < swapchain->imageCount; i++) {
+                if (swapchain->images[i].image) vulkanWrapper.vkDestroyImage(device, swapchain->images[i].image, NULL);
+                if (swapchain->images[i].memory) vulkanWrapper.vkFreeMemory(device, swapchain->images[i].memory, NULL);
+            }
+        }
     }
 
 #ifdef VORTEK_CLI_X11
-    if (swapchain->commandPool) vulkanWrapper.vkDestroyCommandPool(device, swapchain->commandPool, NULL);
     if (swapchain->x11GC) XFreeGC((Display*)swapchain->x11Display, (GC)swapchain->x11GC);
     if (swapchain->x11Image) {
         destroyX11Image((Display*)swapchain->x11Display, (XImage*)swapchain->x11Image,
@@ -917,6 +1188,7 @@ static void releaseCliImageLocked(XWindowSwapchain* swapchain, uint32_t imageInd
 
     swapchain->images[imageIndex].acquired = false;
     swapchain->images[imageIndex].presentQueued = false;
+    swapchain->images[imageIndex].presentSerial = 0;
     pthread_cond_signal(&swapchain->imageAvailableCond);
 }
 
@@ -931,6 +1203,84 @@ static void releaseCliImage(XWindowSwapchain* swapchain, uint32_t imageIndex) {
     pthread_mutex_lock(&swapchain->presentMutex);
     releaseCliImageLocked(swapchain, imageIndex);
     pthread_mutex_unlock(&swapchain->presentMutex);
+}
+
+static VkResult presentDri3Pixmap(XWindowSwapchain* swapchain, uint32_t imageIndex) {
+    XWindowSwapchain_Image* swapchainImage = &swapchain->images[imageIndex];
+    xcb_connection_t* connection = (xcb_connection_t*)swapchain->xcbConnection;
+    if (!connection || !swapchainImage->xcbPixmap) return VK_ERROR_SURFACE_LOST_KHR;
+
+    uint32_t serial = ++swapchain->presentSerial;
+    if (serial == 0) serial = ++swapchain->presentSerial;
+    swapchainImage->presentSerial = serial;
+
+    xcb_void_cookie_t cookie = xcb_present_pixmap_checked(
+        connection, (xcb_window_t)swapchain->x11Window, swapchainImage->xcbPixmap, serial,
+        XCB_NONE, XCB_NONE, 0, 0, XCB_NONE, XCB_NONE, XCB_NONE,
+        XCB_PRESENT_OPTION_COPY, 0, 0, 0, 0, NULL);
+    xcb_flush(connection);
+    if (!xcbRequestSucceeded(connection, cookie)) {
+        swapchainImage->presentSerial = 0;
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
+    return VK_SUCCESS;
+}
+
+static void failDri3Presentation(XWindowSwapchain* swapchain) {
+    pthread_mutex_lock(&swapchain->presentMutex);
+    if (swapchain->presentStatus == VK_SUCCESS) swapchain->presentStatus = VK_ERROR_SURFACE_LOST_KHR;
+    for (int i = 0; i < swapchain->imageCount; i++) {
+        if (swapchain->images[i].presentSerial != 0) releaseCliImageLocked(swapchain, (uint32_t)i);
+    }
+    swapchain->presentPendingCount = 0;
+    pthread_mutex_unlock(&swapchain->presentMutex);
+}
+
+static bool processDri3Events(XWindowSwapchain* swapchain, bool blockForIdle) {
+    xcb_connection_t* connection = (xcb_connection_t*)swapchain->xcbConnection;
+    if (!connection) return false;
+
+    while (true) {
+        xcb_generic_event_t* event = blockForIdle ? xcb_wait_for_event(connection) :
+                                                   xcb_poll_for_event(connection);
+        if (!event) {
+            if (blockForIdle || xcb_connection_has_error(connection)) failDri3Presentation(swapchain);
+            return false;
+        }
+
+        uint8_t responseType = event->response_type & 0x7f;
+        bool handledIdle = false;
+        if (responseType == XCB_GE_GENERIC) {
+            xcb_present_generic_event_t* genericEvent = (xcb_present_generic_event_t*)event;
+            if (genericEvent->extension == swapchain->xcbPresentOpcode &&
+                genericEvent->evtype == XCB_PRESENT_IDLE_NOTIFY) {
+                xcb_present_idle_notify_event_t* idleEvent = (xcb_present_idle_notify_event_t*)event;
+                if (idleEvent->event == swapchain->xcbPresentEvent) {
+                    pthread_mutex_lock(&swapchain->presentMutex);
+                    for (int i = 0; i < swapchain->imageCount; i++) {
+                        XWindowSwapchain_Image* image = &swapchain->images[i];
+                        if (image->presentSerial == idleEvent->serial &&
+                            image->xcbPixmap == idleEvent->pixmap) {
+                            if (swapchain->presentPendingCount > 0) swapchain->presentPendingCount--;
+                            releaseCliImageLocked(swapchain, (uint32_t)i);
+                            handledIdle = true;
+                            break;
+                        }
+                    }
+                    pthread_mutex_unlock(&swapchain->presentMutex);
+                }
+            }
+        }
+        else if (responseType == 0) {
+            free(event);
+            failDri3Presentation(swapchain);
+            return false;
+        }
+
+        free(event);
+        if (blockForIdle && handledIdle) return true;
+        if (!blockForIdle) continue;
+    }
 }
 
 static VkResult getCliPresentStatus(XWindowSwapchain* swapchain, uint32_t imageIndex) {
@@ -965,15 +1315,21 @@ static VkResult enqueueCliPresentImage(XWindowSwapchain* swapchain, uint32_t ima
     return result;
 }
 
-static VkResult finishCliPresentImage(XWindowSwapchain* swapchain, uint32_t imageIndex) {
+static VkResult waitCliPresentFence(XWindowSwapchain* swapchain, uint32_t imageIndex) {
     if (!swapchain || imageIndex >= (uint32_t)swapchain->imageCount) return VK_ERROR_SURFACE_LOST_KHR;
 
     XWindowSwapchain_Image* swapchainImage = &swapchain->images[imageIndex];
-    VkDeviceSize bufferSize = (VkDeviceSize)swapchain->imageExtent.width * swapchain->imageExtent.height * 4;
+    return vulkanWrapper.vkWaitForFences(swapchain->device, 1, &swapchainImage->presentFence,
+                                         VK_TRUE, UINT64_MAX);
+}
 
-    VkResult result = vulkanWrapper.vkWaitForFences(swapchain->device, 1, &swapchainImage->presentFence, VK_TRUE, UINT64_MAX);
+static VkResult finishCliPresentImage(XWindowSwapchain* swapchain, uint32_t imageIndex) {
+    VkResult result = waitCliPresentFence(swapchain, imageIndex);
     if (result != VK_SUCCESS) return result;
+    if (swapchain->useDri3) return presentDri3Pixmap(swapchain, imageIndex);
 
+    XWindowSwapchain_Image* swapchainImage = &swapchain->images[imageIndex];
+    VkDeviceSize bufferSize = (VkDeviceSize)swapchain->imageExtent.width * swapchain->imageExtent.height * 4;
     if (!(swapchainImage->readbackMemoryFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
         VkMappedMemoryRange range = {0};
         range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
@@ -993,10 +1349,21 @@ static void* cliPresentThreadMain(void* param) {
     while (true) {
         pthread_mutex_lock(&swapchain->presentMutex);
         while (swapchain->presentQueueCount == 0 && !swapchain->presentThreadStop) {
+            if (swapchain->useDri3 && swapchain->presentPendingCount > 0) {
+                pthread_mutex_unlock(&swapchain->presentMutex);
+                (void)processDri3Events(swapchain, true);
+                pthread_mutex_lock(&swapchain->presentMutex);
+                continue;
+            }
             pthread_cond_wait(&swapchain->presentCond, &swapchain->presentMutex);
         }
 
         if (swapchain->presentQueueCount == 0 && swapchain->presentThreadStop) {
+            if (swapchain->useDri3 && swapchain->presentPendingCount > 0) {
+                pthread_mutex_unlock(&swapchain->presentMutex);
+                (void)processDri3Events(swapchain, true);
+                continue;
+            }
             pthread_mutex_unlock(&swapchain->presentMutex);
             break;
         }
@@ -1012,8 +1379,15 @@ static void* cliPresentThreadMain(void* param) {
         if (result != VK_SUCCESS && swapchain->presentStatus == VK_SUCCESS) {
             swapchain->presentStatus = result;
         }
-        releaseCliImageLocked(swapchain, imageIndex);
+        if (result == VK_SUCCESS && swapchain->useDri3) {
+            swapchain->presentPendingCount++;
+        }
+        else {
+            releaseCliImageLocked(swapchain, imageIndex);
+        }
         pthread_mutex_unlock(&swapchain->presentMutex);
+
+        if (swapchain->useDri3) (void)processDri3Events(swapchain, false);
     }
 
     return NULL;
@@ -1094,9 +1468,10 @@ static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex
     VkImageMemoryBarrier barrier = {0};
     barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.dstAccessMask = swapchain->useDri3 ? VK_ACCESS_MEMORY_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT;
     barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.newLayout = swapchain->useDri3 ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR :
+                                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = swapchainImage->image;
@@ -1106,28 +1481,34 @@ static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex
     barrier.subresourceRange.baseArrayLayer = 0;
     barrier.subresourceRange.layerCount = 1;
 
-    vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+    VkPipelineStageFlags presentStage = swapchain->useDri3 ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT :
+                                                             VK_PIPELINE_STAGE_TRANSFER_BIT;
+    vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, presentStage,
                                        0, 0, NULL, 0, NULL, 1, &barrier);
 
-    VkBufferImageCopy region = {0};
-    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    region.imageSubresource.mipLevel = 0;
-    region.imageSubresource.baseArrayLayer = 0;
-    region.imageSubresource.layerCount = 1;
-    region.imageExtent.width = swapchain->imageExtent.width;
-    region.imageExtent.height = swapchain->imageExtent.height;
-    region.imageExtent.depth = 1;
+    if (!swapchain->useDri3) {
+        VkBufferImageCopy region = {0};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.mipLevel = 0;
+        region.imageSubresource.baseArrayLayer = 0;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent.width = swapchain->imageExtent.width;
+        region.imageExtent.height = swapchain->imageExtent.height;
+        region.imageExtent.depth = 1;
 
-    vulkanWrapper.vkCmdCopyImageToBuffer(commandBuffer, swapchainImage->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                         swapchainImage->readbackBuffer, 1, &region);
+        vulkanWrapper.vkCmdCopyImageToBuffer(commandBuffer, swapchainImage->image,
+                                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                             swapchainImage->readbackBuffer, 1, &region);
 
-    barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
 
-    vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                       0, 0, NULL, 0, NULL, 1, &barrier);
+        vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                           0, 0, NULL, 0, NULL, 1, &barrier);
+    }
 
     result = vulkanWrapper.vkEndCommandBuffer(commandBuffer);
     if (result != VK_SUCCESS) return result;
@@ -1136,7 +1517,7 @@ static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     VkPipelineStageFlags waitStages[waitSemaphoreCount > 0 ? waitSemaphoreCount : 1];
     for (uint32_t i = 0; i < waitSemaphoreCount; i++) {
-        waitStages[i] = VK_PIPELINE_STAGE_TRANSFER_BIT;
+        waitStages[i] = presentStage;
     }
     submitInfo.waitSemaphoreCount = waitSemaphoreCount;
     submitInfo.pWaitSemaphores = waitSemaphores;
@@ -1152,7 +1533,7 @@ static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex
 
     result = enqueueCliPresentImage(swapchain, imageIndex);
     if (result != VK_SUCCESS) {
-        (void)finishCliPresentImage(swapchain, imageIndex);
+        (void)waitCliPresentFence(swapchain, imageIndex);
         return result;
     }
 

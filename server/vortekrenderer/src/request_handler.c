@@ -164,6 +164,15 @@ void vt_handle_vkCreateDevice(VkContext* context) {
                      extraExtensions, ARRAY_SIZE(extraExtensions),
                      globalImplementedDeviceExtensions, ARRAY_SIZE(globalImplementedDeviceExtensions));
 
+    /* DMA-BUF image export is optional. Enable its extension only for devices
+     * which advertise the handle type so X11 can use the DRI3 fast path. */
+    if (context->hasExternalMemoryDMABuf) {
+        const char* dmaBufExtension[] = {VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME};
+        injectExtensions(context, (char***)&createInfo.ppEnabledExtensionNames, &createInfo.enabledExtensionCount,
+                         dmaBufExtension, ARRAY_SIZE(dmaBufExtension),
+                         globalImplementedDeviceExtensions, ARRAY_SIZE(globalImplementedDeviceExtensions));
+    }
+
     VkDevice device;
     VkResult result = vulkanWrapper.vkCreateDevice(physicalDevice, &createInfo, NULL, &device);
     if (result == VK_SUCCESS) initVulkanDevice(context, physicalDevice, device);
