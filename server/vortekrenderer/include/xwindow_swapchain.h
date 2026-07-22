@@ -36,6 +36,7 @@ typedef struct XWindowSwapchain {
     VkFormat imageFormat;
     VkExtent2D imageExtent;
     VkImageUsageFlags imageUsage;
+    VkPresentModeKHR presentMode;
     VkQueue queue;
     JMethods* jmethods;
 #ifdef VORTEK_CLI_X11
@@ -51,6 +52,7 @@ typedef struct XWindowSwapchain {
     bool presentThreadRunning;
     bool presentThreadStop;
     bool useDri3;
+    int presentWakeFd;
     uint32_t* presentQueue;
     int presentQueueHead;
     int presentQueueCount;
@@ -68,6 +70,8 @@ typedef struct XWindowSwapchain {
     uint8_t x11Bpp;
     uint8_t xcbPresentOpcode;
     int dri3PresentMode;
+    uint32_t xcbPresentCapabilities;
+    uint32_t xcbPresentOptions;
     void* xcbConnection;
     uint32_t xcbPresentEvent;
 #endif

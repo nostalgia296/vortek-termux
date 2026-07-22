@@ -12,6 +12,7 @@
 #include <xcb/sync.h>
 #include <errno.h>
 #include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <time.h>
@@ -158,9 +159,13 @@ static bool isX11Dri3Enabled() {
            vulkanWrapper.vkGetPhysicalDeviceImageFormatProperties2 != NULL;
 }
 
-static void logDri3(const char* format, ...) {
+static bool isDri3DebugEnabled() {
     const char* value = getenv("VORTEK_CLI_X11_DRI3_DEBUG");
-    if (!value || !value[0] || strcmp(value, "0") == 0) return;
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static void logDri3(const char* format, ...) {
+    if (!isDri3DebugEnabled()) return;
 
     va_list args;
     va_start(args, format);
@@ -398,10 +403,39 @@ static bool createXcbDri3State(XWindowSwapchain* swapchain) {
     free(presentVersion);
     if (!hasPresent) goto error;
 
+    errorReply = NULL;
+    xcb_present_query_capabilities_reply_t* capabilitiesReply =
+        xcb_present_query_capabilities_reply(
+            connection,
+            xcb_present_query_capabilities(connection, (uint32_t)swapchain->windowId),
+            &errorReply);
+    uint32_t presentCapabilities = !errorReply && capabilitiesReply ?
+                                   capabilitiesReply->capabilities : 0;
+    free(errorReply);
+    free(capabilitiesReply);
+
+    uint32_t presentOptions = XCB_PRESENT_OPTION_NONE;
+    if (swapchain->presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR) {
+        if (presentCapabilities & XCB_PRESENT_CAPABILITY_ASYNC_MAY_TEAR) {
+            presentOptions = XCB_PRESENT_OPTION_ASYNC_MAY_TEAR;
+        }
+        else if (presentCapabilities & XCB_PRESENT_CAPABILITY_ASYNC) {
+            presentOptions = XCB_PRESENT_OPTION_ASYNC;
+        }
+    }
+    else if (swapchain->presentMode == VK_PRESENT_MODE_MAILBOX_KHR &&
+             (presentCapabilities & XCB_PRESENT_CAPABILITY_ASYNC_MAY_TEAR) &&
+             (presentCapabilities & XCB_PRESENT_CAPABILITY_ASYNC)) {
+        /* With both capabilities, ASYNC replaces a pending flip without tearing. */
+        presentOptions = XCB_PRESENT_OPTION_ASYNC;
+    }
+
     xcb_present_event_t presentEvent = xcb_generate_id(connection);
+    uint32_t presentEventMask = XCB_PRESENT_EVENT_MASK_IDLE_NOTIFY;
+    if (isDri3DebugEnabled()) presentEventMask |= XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY;
     xcb_void_cookie_t selectCookie = xcb_present_select_input_checked(
         connection, presentEvent, (xcb_window_t)swapchain->windowId,
-        XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY | XCB_PRESENT_EVENT_MASK_IDLE_NOTIFY);
+        presentEventMask);
     if (!xcbRequestSucceeded(connection, selectCookie)) goto error;
 
     swapchain->x11Display = display;
@@ -414,7 +448,11 @@ static bool createXcbDri3State(XWindowSwapchain* swapchain) {
     swapchain->xcbPresentEvent = presentEvent;
     swapchain->xcbPresentOpcode = presentExtension->major_opcode;
     swapchain->dri3PresentMode = -1;
+    swapchain->xcbPresentCapabilities = presentCapabilities;
+    swapchain->xcbPresentOptions = presentOptions;
     swapchain->useDri3 = true;
+    logDri3("Present request mode=%d capabilities=0x%x options=0x%x",
+            swapchain->presentMode, presentCapabilities, presentOptions);
     return true;
 
 error:
@@ -1084,6 +1122,9 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, VkPhysicalDevice phys
 
     swapchain->windowId = windowId;
     swapchain->jmethods = jmethods;
+#ifdef VORTEK_CLI_X11
+    swapchain->presentWakeFd = -1;
+#endif
     swapchain->imageCount = swapchainInfo->minImageCount;
     if (swapchain->imageCount <= 0) swapchain->imageCount = getSurfaceMinImageCount();
 #ifdef VORTEK_CLI_X11
@@ -1098,6 +1139,7 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, VkPhysicalDevice phys
     if (!swapchain->images) goto error;
     swapchain->imageFormat = swapchainInfo->imageFormat;
     swapchain->imageUsage = swapchainInfo->imageUsage;
+    swapchain->presentMode = swapchainInfo->presentMode;
     memcpy(&swapchain->imageExtent, &swapchainInfo->imageExtent, sizeof(VkExtent2D));
 #ifdef VORTEK_CLI_X11
     swapchain->device = device;
@@ -1525,12 +1567,11 @@ static VkResult presentDri3Pixmap(XWindowSwapchain* swapchain, uint32_t imageInd
     swapchainImage->presentSerial = serial;
     xshmfence_reset((struct xshmfence*)swapchainImage->xcbShmFence);
 
-    xcb_void_cookie_t cookie = xcb_present_pixmap_checked(
+    xcb_present_pixmap(
         connection, (xcb_window_t)swapchain->x11Window, swapchainImage->xcbPixmap, serial,
         XCB_NONE, XCB_NONE, 0, 0, XCB_NONE, XCB_NONE, swapchainImage->xcbSyncFence,
-        XCB_PRESENT_OPTION_NONE, 0, 0, 0, 0, NULL);
-    xcb_flush(connection);
-    if (!xcbRequestSucceeded(connection, cookie)) {
+        swapchain->xcbPresentOptions, 0, 0, 0, 0, NULL);
+    if (xcb_flush(connection) <= 0) {
         swapchainImage->presentSerial = 0;
         return VK_ERROR_SURFACE_LOST_KHR;
     }
@@ -1619,6 +1660,41 @@ static bool processDri3Events(XWindowSwapchain* swapchain, bool blockForIdle) {
     }
 }
 
+static void wakeCliPresentThread(XWindowSwapchain* swapchain) {
+    if (swapchain->presentWakeFd >= 0) {
+        eventfd_t value = 1;
+        (void)eventfd_write(swapchain->presentWakeFd, value);
+    }
+    else {
+        pthread_cond_signal(&swapchain->presentCond);
+    }
+}
+
+static bool waitForDri3EventOrPresent(XWindowSwapchain* swapchain) {
+    xcb_connection_t* connection = (xcb_connection_t*)swapchain->xcbConnection;
+    if (!connection || swapchain->presentWakeFd < 0) return false;
+
+    struct pollfd pollFds[] = {
+        {.fd = xcb_get_file_descriptor(connection), .events = POLLIN},
+        {.fd = swapchain->presentWakeFd, .events = POLLIN}
+    };
+    int pollResult;
+    do {
+        pollResult = poll(pollFds, ARRAY_SIZE(pollFds), -1);
+    } while (pollResult < 0 && errno == EINTR);
+    if (pollResult <= 0) return false;
+
+    if (pollFds[1].revents & POLLIN) {
+        eventfd_t value;
+        while (eventfd_read(swapchain->presentWakeFd, &value) == 0) {
+        }
+    }
+    if (pollFds[0].revents & (POLLIN | POLLERR | POLLHUP)) {
+        (void)processDri3Events(swapchain, false);
+    }
+    return true;
+}
+
 static VkResult getCliPresentStatus(XWindowSwapchain* swapchain, uint32_t imageIndex) {
     VkResult status = VK_SUCCESS;
 
@@ -1644,7 +1720,7 @@ static VkResult enqueueCliPresentImage(XWindowSwapchain* swapchain, uint32_t ima
         swapchain->presentQueue[queueIndex] = imageIndex;
         swapchain->presentQueueCount++;
         swapchain->images[imageIndex].presentQueued = true;
-        pthread_cond_signal(&swapchain->presentCond);
+        wakeCliPresentThread(swapchain);
     }
 
     pthread_mutex_unlock(&swapchain->presentMutex);
@@ -1685,9 +1761,9 @@ static void* cliPresentThreadMain(void* param) {
     while (true) {
         pthread_mutex_lock(&swapchain->presentMutex);
         while (swapchain->presentQueueCount == 0 && !swapchain->presentThreadStop) {
-            if (swapchain->useDri3 && swapchain->presentPendingCount > 0) {
+            if (swapchain->useDri3) {
                 pthread_mutex_unlock(&swapchain->presentMutex);
-                (void)processDri3Events(swapchain, true);
+                (void)waitForDri3EventOrPresent(swapchain);
                 pthread_mutex_lock(&swapchain->presentMutex);
                 continue;
             }
@@ -1697,7 +1773,7 @@ static void* cliPresentThreadMain(void* param) {
         if (swapchain->presentQueueCount == 0 && swapchain->presentThreadStop) {
             if (swapchain->useDri3 && swapchain->presentPendingCount > 0) {
                 pthread_mutex_unlock(&swapchain->presentMutex);
-                (void)processDri3Events(swapchain, true);
+                (void)waitForDri3EventOrPresent(swapchain);
                 continue;
             }
             pthread_mutex_unlock(&swapchain->presentMutex);
@@ -1733,7 +1809,12 @@ static VkResult startCliPresentThread(XWindowSwapchain* swapchain) {
     swapchain->presentQueue = calloc(swapchain->imageCount, sizeof(uint32_t));
     if (!swapchain->presentQueue) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-    if (pthread_mutex_init(&swapchain->presentMutex, NULL) != 0) goto error_free_queue;
+    if (swapchain->useDri3) {
+        swapchain->presentWakeFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (swapchain->presentWakeFd < 0) goto error_free_queue;
+    }
+
+    if (pthread_mutex_init(&swapchain->presentMutex, NULL) != 0) goto error_close_wake_fd;
     if (pthread_cond_init(&swapchain->presentCond, NULL) != 0) goto error_destroy_mutex;
     if (pthread_cond_init(&swapchain->imageAvailableCond, NULL) != 0) goto error_destroy_present_cond;
 
@@ -1751,6 +1832,9 @@ error_destroy_present_cond:
     pthread_cond_destroy(&swapchain->presentCond);
 error_destroy_mutex:
     pthread_mutex_destroy(&swapchain->presentMutex);
+error_close_wake_fd:
+    if (swapchain->presentWakeFd >= 0) close(swapchain->presentWakeFd);
+    swapchain->presentWakeFd = -1;
 error_free_queue:
     MEMFREE(swapchain->presentQueue);
     return VK_ERROR_INITIALIZATION_FAILED;
@@ -1761,7 +1845,7 @@ static void stopCliPresentThread(XWindowSwapchain* swapchain) {
 
     pthread_mutex_lock(&swapchain->presentMutex);
     swapchain->presentThreadStop = true;
-    pthread_cond_signal(&swapchain->presentCond);
+    wakeCliPresentThread(swapchain);
     pthread_mutex_unlock(&swapchain->presentMutex);
 
     if (swapchain->presentThreadRunning) {
@@ -1772,6 +1856,8 @@ static void stopCliPresentThread(XWindowSwapchain* swapchain) {
     pthread_cond_destroy(&swapchain->imageAvailableCond);
     pthread_cond_destroy(&swapchain->presentCond);
     pthread_mutex_destroy(&swapchain->presentMutex);
+    if (swapchain->presentWakeFd >= 0) close(swapchain->presentWakeFd);
+    swapchain->presentWakeFd = -1;
     MEMFREE(swapchain->presentQueue);
     swapchain->presentSyncInitialized = false;
 }
