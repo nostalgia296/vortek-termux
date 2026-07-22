@@ -9,11 +9,18 @@ typedef struct XWindowSwapchain_Image {
     VkImage image;
     VkDeviceMemory memory;
 #ifdef VORTEK_CLI_X11
+    AHardwareBuffer* hardwareBuffer;
+    VkImage dri3PresentImage;
+    VkDeviceMemory dri3PresentMemory;
+    bool dri3Blit;
+    bool dri3PresentImageInitialized;
     bool acquired;
     bool presentQueued;
     VkCommandBuffer commandBuffer;
     VkFence presentFence;
     uint32_t xcbPixmap;
+    uint32_t xcbSyncFence;
+    void* xcbShmFence;
     uint32_t presentSerial;
     VkBuffer readbackBuffer;
     VkDeviceMemory readbackMemory;
@@ -33,6 +40,7 @@ typedef struct XWindowSwapchain {
     JMethods* jmethods;
 #ifdef VORTEK_CLI_X11
     VkDevice device;
+    VkPhysicalDevice physicalDevice;
     VkCommandPool commandPool;
     uint32_t nextImageIndex;
     pthread_mutex_t presentMutex;
@@ -71,7 +79,7 @@ extern bool XWindowSwapchain_hasPresentationBackend(JMethods* jmethods);
 extern int getSurfaceMinImageCount();
 extern VkSurfaceFormatKHR* getSurfaceFormats(uint32_t* formatCount);
 
-extern XWindowSwapchain* XWindowSwapchain_create(VkDevice device, uint32_t graphicsQueueIndex, VkSwapchainCreateInfoKHR* swapchainInfo, JMethods* jmethods, uint64_t windowId);
+extern XWindowSwapchain* XWindowSwapchain_create(VkDevice device, VkPhysicalDevice physicalDevice, uint32_t graphicsQueueIndex, VkSwapchainCreateInfoKHR* swapchainInfo, JMethods* jmethods, uint64_t windowId);
 extern void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain);
 extern VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t timeout, VkSemaphore signalSemaphore, VkFence fence, uint32_t* imageIndex);
 extern VkResult XWindowSwapchain_waitForPresent(XWindowSwapchain* swapchain, uint32_t waitSemaphoreCount, const VkSemaphore* waitSemaphores);

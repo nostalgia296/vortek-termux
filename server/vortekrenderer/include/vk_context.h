@@ -33,6 +33,7 @@ typedef struct VkContext {
     RingBuffer* serverRing;
     VkResult status;
 
+    VkPhysicalDevice physicalDevice;
     int graphicsQueueIndex;
 
     TextureDecoder* textureDecoder;

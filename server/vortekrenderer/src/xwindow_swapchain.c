@@ -5,13 +5,22 @@
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XShm.h>
+#include <X11/xshmfence.h>
 #include <xcb/xcb.h>
 #include <xcb/dri3.h>
 #include <xcb/present.h>
+#include <xcb/sync.h>
 #include <errno.h>
+#include <poll.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <time.h>
+
+/* Termux:X11 private DRI3 modifier: the only plane FD is an AHB socket. */
+#define TERMUX_X11_AHARDWAREBUFFER_SOCKET_MODIFIER UINT64_C(1255)
+#define TERMUX_X11_AHARDWAREBUFFER_HANDSHAKE_TIMEOUT_MS 5000
+/* Android's public NDK header does not expose this HAL format constant. */
+#define AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM 5
 
 #if defined(__aarch64__) || defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -135,7 +144,20 @@ static bool isX11ShmEnabled() {
 static bool isX11Dri3Enabled() {
     const char* value = getenv("VORTEK_CLI_X11_DRI3");
     return (!value || !value[0] || strcmp(value, "0") != 0) &&
-           (vulkanWrapper.vkGetMemoryFd != NULL);
+           vulkanWrapper.vkGetAndroidHardwareBufferPropertiesANDROID != NULL &&
+           vulkanWrapper.vkGetPhysicalDeviceImageFormatProperties2 != NULL;
+}
+
+static void logDri3(const char* format, ...) {
+    const char* value = getenv("VORTEK_CLI_X11_DRI3_DEBUG");
+    if (!value || !value[0] || strcmp(value, "0") == 0) return;
+
+    va_list args;
+    va_start(args, format);
+    fputs("vortek-cli: DRI3: ", stderr);
+    vfprintf(stderr, format, args);
+    fputc('\n', stderr);
+    va_end(args);
 }
 
 static void destroyX11Image(Display* display, XImage* image, XShmSegmentInfo* shmInfo) {
@@ -277,7 +299,8 @@ static bool createX11Image(XWindowSwapchain* swapchain) {
 }
 
 static bool isDri3FormatSupported(VkFormat format) {
-    return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
+    return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB ||
+           format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB;
 }
 
 static bool xcbRequestSucceeded(xcb_connection_t* connection, xcb_void_cookie_t cookie) {
@@ -353,8 +376,10 @@ static bool createXcbDri3State(XWindowSwapchain* swapchain) {
 
     errorReply = NULL;
     xcb_present_query_version_reply_t* presentVersion = xcb_present_query_version_reply(
-        connection, xcb_present_query_version(connection, 1, 0), &errorReply);
-    bool hasPresent = !errorReply && presentVersion && presentVersion->major_version >= 1;
+        connection, xcb_present_query_version(connection, 1, 2), &errorReply);
+    bool hasPresent = !errorReply && presentVersion &&
+                      (presentVersion->major_version > 1 ||
+                       (presentVersion->major_version == 1 && presentVersion->minor_version >= 2));
     free(errorReply);
     free(presentVersion);
     if (!hasPresent) goto error;
@@ -439,7 +464,8 @@ static AHardwareBuffer* getWindowHardwareBuffer(JMethods* jmethods, uint64_t win
 static VkResult createImageMemory(VkDevice device, VkImage image, AHardwareBuffer* hardwareBuffer, VkDeviceMemory* pMemory) {
     VkAndroidHardwareBufferPropertiesANDROID ahbProperties = {0};
     ahbProperties.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
-    vulkanWrapper.vkGetAndroidHardwareBufferPropertiesANDROID(device, hardwareBuffer, &ahbProperties);
+    VkResult result = vulkanWrapper.vkGetAndroidHardwareBufferPropertiesANDROID(device, hardwareBuffer, &ahbProperties);
+    if (result != VK_SUCCESS) return result;
 
     VkImportAndroidHardwareBufferInfoANDROID memoryImportInfo = {0};
     memoryImportInfo.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
@@ -457,12 +483,15 @@ static VkResult createImageMemory(VkDevice device, VkImage image, AHardwareBuffe
     memoryInfo.allocationSize = ahbProperties.allocationSize;
     memoryInfo.memoryTypeIndex = getMemoryTypeIndex(ahbProperties.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-    VkDeviceMemory memory;
-    VkResult result = vulkanWrapper.vkAllocateMemory(device, &memoryInfo, NULL, &memory);
+    VkDeviceMemory memory = VK_NULL_HANDLE;
+    result = vulkanWrapper.vkAllocateMemory(device, &memoryInfo, NULL, &memory);
     if (result != VK_SUCCESS) return result;
 
     result = vulkanWrapper.vkBindImageMemory(device, image, memory, 0);
-    if (result != VK_SUCCESS) return result;
+    if (result != VK_SUCCESS) {
+        vulkanWrapper.vkFreeMemory(device, memory, NULL);
+        return result;
+    }
 
     *pMemory = memory;
     return VK_SUCCESS;
@@ -541,79 +570,235 @@ static VkResult createDeviceLocalImageMemory(VkDevice device, VkImage image, VkD
     return VK_SUCCESS;
 }
 
-static VkResult createExportableImageMemory(VkDevice device, VkImage image, VkDeviceMemory* pMemory) {
-    VkMemoryRequirements memReqs = {0};
-    vulkanWrapper.vkGetImageMemoryRequirements(device, image, &memReqs);
-
-    VkExportMemoryAllocateInfo exportInfo = {0};
-    exportInfo.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
-    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
-
-    VkMemoryDedicatedAllocateInfo dedicatedInfo = {0};
-    dedicatedInfo.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
-    dedicatedInfo.pNext = &exportInfo;
-    dedicatedInfo.image = image;
-
-    VkMemoryAllocateInfo memoryInfo = {0};
-    memoryInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-    memoryInfo.pNext = &dedicatedInfo;
-    memoryInfo.allocationSize = memReqs.size;
-    memoryInfo.memoryTypeIndex = getMemoryTypeIndex(memReqs.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-
-    VkDeviceMemory memory = VK_NULL_HANDLE;
-    VkResult result = vulkanWrapper.vkAllocateMemory(device, &memoryInfo, NULL, &memory);
-    if (result != VK_SUCCESS) return result;
-
-    result = vulkanWrapper.vkBindImageMemory(device, image, memory, 0);
-    if (result != VK_SUCCESS) {
-        vulkanWrapper.vkFreeMemory(device, memory, NULL);
-        return result;
+static bool getDri3HardwareBufferFormat(VkFormat imageFormat, uint32_t* ahbFormat, VkFormat* vkFormat) {
+    switch (imageFormat) {
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SRGB:
+            *ahbFormat = AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM;
+            *vkFormat = VK_FORMAT_B8G8R8A8_UNORM;
+            return true;
+        case VK_FORMAT_R8G8B8A8_UNORM:
+        case VK_FORMAT_R8G8B8A8_SRGB:
+            *ahbFormat = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+            *vkFormat = VK_FORMAT_R8G8B8A8_UNORM;
+            return true;
+        default:
+            return false;
     }
+}
 
-    *pMemory = memory;
+static uint64_t getDri3HardwareBufferUsage(XWindowSwapchain* swapchain, VkFormat format,
+                                            VkImageTiling tiling, VkImageUsageFlags usage) {
+    if (!swapchain->physicalDevice || !vulkanWrapper.vkGetPhysicalDeviceImageFormatProperties2) return 0;
+
+    VkPhysicalDeviceExternalImageFormatInfo externalInfo = {0};
+    externalInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
+    externalInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
+
+    VkPhysicalDeviceImageFormatInfo2 imageFormatInfo = {0};
+    imageFormatInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2;
+    imageFormatInfo.pNext = &externalInfo;
+    imageFormatInfo.format = format;
+    imageFormatInfo.type = VK_IMAGE_TYPE_2D;
+    imageFormatInfo.tiling = tiling;
+    imageFormatInfo.usage = usage;
+
+    VkAndroidHardwareBufferUsageANDROID ahbUsage = {0};
+    ahbUsage.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_USAGE_ANDROID;
+
+    VkImageFormatProperties2 imageFormatProperties = {0};
+    imageFormatProperties.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2;
+    imageFormatProperties.pNext = &ahbUsage;
+
+    VkResult result = vulkanWrapper.vkGetPhysicalDeviceImageFormatProperties2(
+        swapchain->physicalDevice, &imageFormatInfo, &imageFormatProperties);
+    return result == VK_SUCCESS ? ahbUsage.androidHardwareBufferUsage : 0;
+}
+
+static VkResult allocateDri3HardwareBuffer(XWindowSwapchain* swapchain,
+                                            XWindowSwapchain_Image* swapchainImage,
+                                            uint32_t ahbFormat, VkFormat presentFormat) {
+    uint64_t usage = getDri3HardwareBufferUsage(swapchain, swapchain->imageFormat,
+                                                VK_IMAGE_TILING_OPTIMAL, swapchain->imageUsage);
+    usage |= getDri3HardwareBufferUsage(swapchain, presentFormat, VK_IMAGE_TILING_LINEAR,
+                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+    usage |= AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
+             AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
+    usage &= ~AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER;
+
+    AHardwareBuffer_Desc desc = {0};
+    desc.width = swapchain->imageExtent.width;
+    desc.height = swapchain->imageExtent.height;
+    desc.layers = 1;
+    desc.format = ahbFormat;
+    desc.usage = usage;
+
+    int error = AHardwareBuffer_allocate(&desc, &swapchainImage->hardwareBuffer);
+    return error == 0 && swapchainImage->hardwareBuffer ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+}
+
+static VkResult getDri3HardwareBufferProperties(VkDevice device, AHardwareBuffer* hardwareBuffer,
+                                                 VkAndroidHardwareBufferPropertiesANDROID* properties,
+                                                 VkAndroidHardwareBufferFormatPropertiesANDROID* formatProperties) {
+    *formatProperties = (VkAndroidHardwareBufferFormatPropertiesANDROID){0};
+    formatProperties->sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_FORMAT_PROPERTIES_ANDROID;
+
+    *properties = (VkAndroidHardwareBufferPropertiesANDROID){0};
+    properties->sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+    properties->pNext = formatProperties;
+
+    VkResult result = vulkanWrapper.vkGetAndroidHardwareBufferPropertiesANDROID(device, hardwareBuffer, properties);
+    if (result != VK_SUCCESS) return result;
+    if (formatProperties->format == VK_FORMAT_UNDEFINED) return VK_ERROR_FORMAT_NOT_SUPPORTED;
     return VK_SUCCESS;
 }
 
-static VkResult createDri3Pixmap(VkDevice device, XWindowSwapchain* swapchain,
-                                 XWindowSwapchain_Image* swapchainImage) {
-    VkImageSubresource subresource = {0};
-    subresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+static VkResult createDri3AhbImage(VkDevice device, XWindowSwapchain* swapchain,
+                                   AHardwareBuffer* hardwareBuffer, VkFormat format,
+                                   VkImageTiling tiling, VkImageUsageFlags usage,
+                                   VkImage* image, VkDeviceMemory* memory) {
+    VkExternalMemoryImageCreateInfo externalInfo = {0};
+    externalInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
+    externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
 
-    VkSubresourceLayout layout = {0};
-    vulkanWrapper.vkGetImageSubresourceLayout(device, swapchainImage->image, &subresource, &layout);
-    VkDeviceSize minimumRowPitch = (VkDeviceSize)swapchain->imageExtent.width * 4;
-    if (layout.rowPitch < minimumRowPitch || layout.rowPitch > UINT32_MAX || layout.offset > UINT32_MAX) {
-        return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    VkImageCreateInfo imageInfo = {0};
+    imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    imageInfo.pNext = &externalInfo;
+    imageInfo.imageType = VK_IMAGE_TYPE_2D;
+    imageInfo.format = format;
+    imageInfo.extent.width = swapchain->imageExtent.width;
+    imageInfo.extent.height = swapchain->imageExtent.height;
+    imageInfo.extent.depth = 1;
+    imageInfo.mipLevels = 1;
+    imageInfo.arrayLayers = 1;
+    imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+    imageInfo.tiling = tiling;
+    imageInfo.usage = usage;
+    imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+    VkResult result = vulkanWrapper.vkCreateImage(device, &imageInfo, NULL, image);
+    if (result != VK_SUCCESS) return result;
+
+    result = createImageMemory(device, *image, hardwareBuffer, memory);
+    if (result != VK_SUCCESS) {
+        vulkanWrapper.vkDestroyImage(device, *image, NULL);
+        *image = VK_NULL_HANDLE;
     }
+    return result;
+}
 
-    VkMemoryGetFdInfoKHR getFdInfo = {0};
-    getFdInfo.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
-    getFdInfo.memory = swapchainImage->memory;
-    getFdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+static bool waitForDri3HardwareBufferHandshake(int socketFd) {
+    struct pollfd pollFd = {.fd = socketFd, .events = POLLIN};
+    int pollResult;
+    do {
+        pollResult = poll(&pollFd, 1, TERMUX_X11_AHARDWAREBUFFER_HANDSHAKE_TIMEOUT_MS);
+    } while (pollResult < 0 && errno == EINTR);
+    if (pollResult <= 0 || !(pollFd.revents & POLLIN)) return false;
 
-    int fd = -1;
-    VkResult result = vulkanWrapper.vkGetMemoryFd(device, &getFdInfo, &fd);
-    if (result != VK_SUCCESS || fd < 0) {
-        if (fd >= 0) close(fd);
-        return result == VK_SUCCESS ? VK_ERROR_INVALID_EXTERNAL_HANDLE : result;
+    uint8_t acknowledgement;
+    ssize_t readResult;
+    do {
+        readResult = read(socketFd, &acknowledgement, sizeof(acknowledgement));
+    } while (readResult < 0 && errno == EINTR);
+    return readResult == (ssize_t)sizeof(acknowledgement);
+}
+
+static VkResult createDri3IdleFence(XWindowSwapchain* swapchain,
+                                    XWindowSwapchain_Image* swapchainImage,
+                                    xcb_pixmap_t pixmap) {
+    int fenceFd = xshmfence_alloc_shm();
+    if (fenceFd < 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    struct xshmfence* shmFence = xshmfence_map_shm(fenceFd);
+    if (!shmFence) {
+        close(fenceFd);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
 
     xcb_connection_t* connection = (xcb_connection_t*)swapchain->xcbConnection;
-    xcb_pixmap_t pixmap = xcb_generate_id(connection);
-    int32_t buffers[] = {fd};
-    /* libxcb owns and closes fds after the request is queued. */
+    xcb_sync_fence_t syncFence = xcb_generate_id(connection);
+    xcb_void_cookie_t cookie = xcb_dri3_fence_from_fd_checked(
+        connection, pixmap, syncFence, false, fenceFd);
+    xcb_flush(connection);
+    if (!xcbRequestSucceeded(connection, cookie)) {
+        xshmfence_unmap_shm(shmFence);
+        return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+    }
+
+    if (xshmfence_trigger(shmFence) != 0) {
+        cookie = xcb_sync_destroy_fence_checked(connection, syncFence);
+        xcb_flush(connection);
+        (void)xcbRequestSucceeded(connection, cookie);
+        xshmfence_unmap_shm(shmFence);
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+
+    swapchainImage->xcbSyncFence = syncFence;
+    swapchainImage->xcbShmFence = shmFence;
+    return VK_SUCCESS;
+}
+
+static VkResult createDri3Pixmap(XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage) {
+    if (!swapchainImage->hardwareBuffer) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+    int socketFds[2] = {-1, -1};
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, socketFds) != 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    VkResult result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+    xcb_connection_t* connection = (xcb_connection_t*)swapchain->xcbConnection;
+    xcb_pixmap_t pixmap = XCB_NONE;
+    if (AHardwareBuffer_sendHandleToUnixSocket(swapchainImage->hardwareBuffer, socketFds[0]) != 0) {
+        logDri3("failed to send AHardwareBuffer handle");
+        goto out;
+    }
+
+    int xcbFd = dup(socketFds[1]);
+    if (xcbFd < 0) {
+        result = VK_ERROR_OUT_OF_HOST_MEMORY;
+        goto out;
+    }
+
+    pixmap = xcb_generate_id(connection);
+    int32_t buffers[] = {xcbFd};
+    /* libxcb takes ownership of xcbFd after queueing this request. */
     xcb_void_cookie_t cookie = xcb_dri3_pixmap_from_buffers_checked(
         connection, pixmap, (xcb_window_t)swapchain->x11Window, 1,
         (uint16_t)swapchain->imageExtent.width, (uint16_t)swapchain->imageExtent.height,
-        (uint32_t)layout.rowPitch, (uint32_t)layout.offset,
-        0, 0, 0, 0, 0, 0,
-        swapchain->x11Depth, swapchain->x11Bpp, 0, buffers);
+        0, 0, 0, 0, 0, 0, 0, 0,
+        swapchain->x11Depth, swapchain->x11Bpp,
+        TERMUX_X11_AHARDWAREBUFFER_SOCKET_MODIFIER, buffers);
     xcb_flush(connection);
-    bool pixmapCreated = xcbRequestSucceeded(connection, cookie);
-    if (!pixmapCreated) return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+    if (!xcbRequestSucceeded(connection, cookie)) {
+        logDri3("PixmapFromBuffers rejected modifier %llu",
+                (unsigned long long)TERMUX_X11_AHARDWAREBUFFER_SOCKET_MODIFIER);
+        goto out;
+    }
+    if (!waitForDri3HardwareBufferHandshake(socketFds[0])) {
+        logDri3("AHardwareBuffer socket handshake timed out");
+        goto out_free_pixmap;
+    }
+    result = createDri3IdleFence(swapchain, swapchainImage, pixmap);
+    if (result != VK_SUCCESS) {
+        logDri3("failed to create idle fence: VkResult=%d", result);
+        goto out_free_pixmap;
+    }
 
     swapchainImage->xcbPixmap = pixmap;
-    return VK_SUCCESS;
+    result = VK_SUCCESS;
+    goto out;
+
+out_free_pixmap:
+    if (pixmap != XCB_NONE) {
+        xcb_void_cookie_t freeCookie = xcb_free_pixmap_checked(connection, pixmap);
+        xcb_flush(connection);
+        (void)xcbRequestSucceeded(connection, freeCookie);
+    }
+out:
+    if (socketFds[0] >= 0) close(socketFds[0]);
+    if (socketFds[1] >= 0) close(socketFds[1]);
+    return result;
 }
 
 static VkResult createReadbackBuffer(VkDevice device, XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage) {
@@ -649,15 +834,88 @@ static VkResult createReadbackBuffer(VkDevice device, XWindowSwapchain* swapchai
 }
 
 static VkResult createCliImage(VkDevice device, XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage) {
-    VkExternalMemoryImageCreateInfo externalInfo = {0};
     if (swapchain->useDri3) {
-        externalInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-        externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
+        uint32_t ahbFormat;
+        VkFormat ahbVkFormat;
+        if (!getDri3HardwareBufferFormat(swapchain->imageFormat, &ahbFormat, &ahbVkFormat)) {
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+        }
+
+        VkResult result = allocateDri3HardwareBuffer(swapchain, swapchainImage, ahbFormat, ahbVkFormat);
+        if (result != VK_SUCCESS) {
+            logDri3("AHardwareBuffer allocation failed: VkResult=%d", result);
+            return result;
+        }
+
+        VkAndroidHardwareBufferPropertiesANDROID ahbProperties;
+        VkAndroidHardwareBufferFormatPropertiesANDROID ahbFormatProperties;
+        result = getDri3HardwareBufferProperties(device, swapchainImage->hardwareBuffer,
+                                                  &ahbProperties, &ahbFormatProperties);
+        logDri3("AHardwareBuffer properties: VkResult=%d format=%d externalFormat=%llu memoryTypeBits=0x%x",
+                result, ahbFormatProperties.format,
+                (unsigned long long)ahbFormatProperties.externalFormat,
+                ahbProperties.memoryTypeBits);
+        if (result != VK_SUCCESS) return result;
+
+        if (ahbFormatProperties.format == swapchain->imageFormat) {
+            result = createDri3AhbImage(device, swapchain, swapchainImage->hardwareBuffer,
+                                        ahbFormatProperties.format, VK_IMAGE_TILING_OPTIMAL,
+                                        swapchain->imageUsage, &swapchainImage->image,
+                                        &swapchainImage->memory);
+            if (result == VK_SUCCESS) {
+                result = createDri3Pixmap(swapchain, swapchainImage);
+                if (result == VK_SUCCESS) logDri3("using direct AHardwareBuffer presentation");
+                return result;
+            }
+            logDri3("direct AHardwareBuffer image import failed: VkResult=%d; trying blit", result);
+        }
+
+        if (swapchainImage->image) {
+            vulkanWrapper.vkDestroyImage(device, swapchainImage->image, NULL);
+            swapchainImage->image = VK_NULL_HANDLE;
+        }
+        if (swapchainImage->memory) {
+            vulkanWrapper.vkFreeMemory(device, swapchainImage->memory, NULL);
+            swapchainImage->memory = VK_NULL_HANDLE;
+        }
+
+        VkImageCreateInfo imageInfo = {0};
+        imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageInfo.imageType = VK_IMAGE_TYPE_2D;
+        imageInfo.format = swapchain->imageFormat;
+        imageInfo.extent.width = swapchain->imageExtent.width;
+        imageInfo.extent.height = swapchain->imageExtent.height;
+        imageInfo.extent.depth = 1;
+        imageInfo.mipLevels = 1;
+        imageInfo.arrayLayers = 1;
+        imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
+        imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+        imageInfo.usage = swapchain->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+        imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+
+        result = vulkanWrapper.vkCreateImage(device, &imageInfo, NULL, &swapchainImage->image);
+        if (result != VK_SUCCESS) return result;
+        result = createDeviceLocalImageMemory(device, swapchainImage->image, &swapchainImage->memory);
+        if (result != VK_SUCCESS) return result;
+
+        result = createDri3AhbImage(device, swapchain, swapchainImage->hardwareBuffer,
+                                    ahbFormatProperties.format, VK_IMAGE_TILING_LINEAR,
+                                    VK_IMAGE_USAGE_TRANSFER_DST_BIT, &swapchainImage->dri3PresentImage,
+                                    &swapchainImage->dri3PresentMemory);
+        if (result != VK_SUCCESS) {
+            logDri3("blit AHardwareBuffer image import failed: VkResult=%d", result);
+            return result;
+        }
+
+        swapchainImage->dri3Blit = true;
+        result = createDri3Pixmap(swapchain, swapchainImage);
+        if (result == VK_SUCCESS) logDri3("using AHardwareBuffer blit presentation");
+        return result;
     }
 
     VkImageCreateInfo imageInfo = {0};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-    imageInfo.pNext = swapchain->useDri3 ? &externalInfo : NULL;
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
     imageInfo.format = swapchain->imageFormat;
     imageInfo.extent.width = swapchain->imageExtent.width;
@@ -666,22 +924,18 @@ static VkResult createCliImage(VkDevice device, XWindowSwapchain* swapchain, XWi
     imageInfo.mipLevels = 1;
     imageInfo.arrayLayers = 1;
     imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-    imageInfo.tiling = swapchain->useDri3 ? VK_IMAGE_TILING_LINEAR : VK_IMAGE_TILING_OPTIMAL;
-    imageInfo.usage = swapchain->imageUsage |
-                      (swapchain->useDri3 ? 0 : VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+    imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
+    imageInfo.usage = swapchain->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 
     VkResult result = vulkanWrapper.vkCreateImage(device, &imageInfo, NULL, &swapchainImage->image);
     if (result != VK_SUCCESS) return result;
 
-    result = swapchain->useDri3 ?
-             createExportableImageMemory(device, swapchainImage->image, &swapchainImage->memory) :
-             createDeviceLocalImageMemory(device, swapchainImage->image, &swapchainImage->memory);
+    result = createDeviceLocalImageMemory(device, swapchainImage->image, &swapchainImage->memory);
     if (result != VK_SUCCESS) return result;
 
-    return swapchain->useDri3 ? createDri3Pixmap(device, swapchain, swapchainImage) :
-                               createReadbackBuffer(device, swapchain, swapchainImage);
+    return createReadbackBuffer(device, swapchain, swapchainImage);
 }
 
 static VkResult createCliCommandResources(VkDevice device, uint32_t graphicsQueueIndex, XWindowSwapchain* swapchain) {
@@ -714,8 +968,16 @@ static VkResult createCliCommandResources(VkDevice device, uint32_t graphicsQueu
 
 static void destroyCliImage(VkDevice device, XWindowSwapchain* swapchain,
                             XWindowSwapchain_Image* swapchainImage) {
-    if (swapchainImage->xcbPixmap && swapchain->xcbConnection) {
-        xcb_connection_t* connection = (xcb_connection_t*)swapchain->xcbConnection;
+    xcb_connection_t* connection = (xcb_connection_t*)swapchain->xcbConnection;
+    if (swapchainImage->xcbSyncFence && connection) {
+        xcb_void_cookie_t cookie = xcb_sync_destroy_fence_checked(connection, swapchainImage->xcbSyncFence);
+        xcb_flush(connection);
+        (void)xcbRequestSucceeded(connection, cookie);
+    }
+    if (swapchainImage->xcbShmFence) {
+        xshmfence_unmap_shm((struct xshmfence*)swapchainImage->xcbShmFence);
+    }
+    if (swapchainImage->xcbPixmap && connection) {
         xcb_void_cookie_t cookie = xcb_free_pixmap_checked(connection, swapchainImage->xcbPixmap);
         xcb_flush(connection);
         (void)xcbRequestSucceeded(connection, cookie);
@@ -723,10 +985,20 @@ static void destroyCliImage(VkDevice device, XWindowSwapchain* swapchain,
     if (swapchainImage->readbackData) vulkanWrapper.vkUnmapMemory(device, swapchainImage->readbackMemory);
     if (swapchainImage->readbackBuffer) vulkanWrapper.vkDestroyBuffer(device, swapchainImage->readbackBuffer, NULL);
     if (swapchainImage->readbackMemory) vulkanWrapper.vkFreeMemory(device, swapchainImage->readbackMemory, NULL);
+    if (swapchainImage->dri3PresentImage) vulkanWrapper.vkDestroyImage(device, swapchainImage->dri3PresentImage, NULL);
+    if (swapchainImage->dri3PresentMemory) vulkanWrapper.vkFreeMemory(device, swapchainImage->dri3PresentMemory, NULL);
     if (swapchainImage->image) vulkanWrapper.vkDestroyImage(device, swapchainImage->image, NULL);
     if (swapchainImage->memory) vulkanWrapper.vkFreeMemory(device, swapchainImage->memory, NULL);
+    if (swapchainImage->hardwareBuffer) AHardwareBuffer_release(swapchainImage->hardwareBuffer);
 
     swapchainImage->xcbPixmap = 0;
+    swapchainImage->xcbSyncFence = 0;
+    swapchainImage->xcbShmFence = NULL;
+    swapchainImage->hardwareBuffer = NULL;
+    swapchainImage->dri3PresentImage = VK_NULL_HANDLE;
+    swapchainImage->dri3PresentMemory = VK_NULL_HANDLE;
+    swapchainImage->dri3Blit = false;
+    swapchainImage->dri3PresentImageInitialized = false;
     swapchainImage->readbackData = NULL;
     swapchainImage->readbackBuffer = VK_NULL_HANDLE;
     swapchainImage->readbackMemory = VK_NULL_HANDLE;
@@ -775,7 +1047,7 @@ VkSurfaceFormatKHR* getSurfaceFormats(uint32_t* formatCount) {
     return surfaceFormats;
 }
 
-XWindowSwapchain* XWindowSwapchain_create(VkDevice device, uint32_t graphicsQueueIndex, VkSwapchainCreateInfoKHR* swapchainInfo, JMethods* jmethods, uint64_t windowId) {
+XWindowSwapchain* XWindowSwapchain_create(VkDevice device, VkPhysicalDevice physicalDevice, uint32_t graphicsQueueIndex, VkSwapchainCreateInfoKHR* swapchainInfo, JMethods* jmethods, uint64_t windowId) {
     XWindowSwapchain* swapchain = calloc(1, sizeof(XWindowSwapchain));
     if (!swapchain) return NULL;
 
@@ -803,6 +1075,7 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, uint32_t graphicsQueu
     memcpy(&swapchain->imageExtent, &swapchainInfo->imageExtent, sizeof(VkExtent2D));
 #ifdef VORTEK_CLI_X11
     swapchain->device = device;
+    swapchain->physicalDevice = physicalDevice;
 #endif
 
     VkResult result = VK_SUCCESS;
@@ -1208,15 +1481,19 @@ static void releaseCliImage(XWindowSwapchain* swapchain, uint32_t imageIndex) {
 static VkResult presentDri3Pixmap(XWindowSwapchain* swapchain, uint32_t imageIndex) {
     XWindowSwapchain_Image* swapchainImage = &swapchain->images[imageIndex];
     xcb_connection_t* connection = (xcb_connection_t*)swapchain->xcbConnection;
-    if (!connection || !swapchainImage->xcbPixmap) return VK_ERROR_SURFACE_LOST_KHR;
+    if (!connection || !swapchainImage->xcbPixmap ||
+        !swapchainImage->xcbSyncFence || !swapchainImage->xcbShmFence) {
+        return VK_ERROR_SURFACE_LOST_KHR;
+    }
 
     uint32_t serial = ++swapchain->presentSerial;
     if (serial == 0) serial = ++swapchain->presentSerial;
     swapchainImage->presentSerial = serial;
+    xshmfence_reset((struct xshmfence*)swapchainImage->xcbShmFence);
 
     xcb_void_cookie_t cookie = xcb_present_pixmap_checked(
         connection, (xcb_window_t)swapchain->x11Window, swapchainImage->xcbPixmap, serial,
-        XCB_NONE, XCB_NONE, 0, 0, XCB_NONE, XCB_NONE, XCB_NONE,
+        XCB_NONE, XCB_NONE, 0, 0, XCB_NONE, XCB_NONE, swapchainImage->xcbSyncFence,
         XCB_PRESENT_OPTION_COPY, 0, 0, 0, 0, NULL);
     xcb_flush(connection);
     if (!xcbRequestSucceeded(connection, cookie)) {
@@ -1261,6 +1538,10 @@ static bool processDri3Events(XWindowSwapchain* swapchain, bool blockForIdle) {
                         XWindowSwapchain_Image* image = &swapchain->images[i];
                         if (image->presentSerial == idleEvent->serial &&
                             image->xcbPixmap == idleEvent->pixmap) {
+                            if (!image->xcbShmFence ||
+                                xshmfence_await((struct xshmfence*)image->xcbShmFence) != 0) {
+                                swapchain->presentStatus = VK_ERROR_SURFACE_LOST_KHR;
+                            }
                             if (swapchain->presentPendingCount > 0) swapchain->presentPendingCount--;
                             releaseCliImageLocked(swapchain, (uint32_t)i);
                             handledIdle = true;
@@ -1465,49 +1746,112 @@ static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex
     result = vulkanWrapper.vkBeginCommandBuffer(commandBuffer, &beginInfo);
     if (result != VK_SUCCESS) return result;
 
-    VkImageMemoryBarrier barrier = {0};
-    barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-    barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-    barrier.dstAccessMask = swapchain->useDri3 ? VK_ACCESS_MEMORY_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT;
-    barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    barrier.newLayout = swapchain->useDri3 ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR :
-                                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barrier.image = swapchainImage->image;
-    barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barrier.subresourceRange.baseMipLevel = 0;
-    barrier.subresourceRange.levelCount = 1;
-    barrier.subresourceRange.baseArrayLayer = 0;
-    barrier.subresourceRange.layerCount = 1;
+    VkPipelineStageFlags presentStage;
+    if (swapchain->useDri3 && swapchainImage->dri3Blit) {
+        if (!swapchainImage->dri3PresentImage) return VK_ERROR_INITIALIZATION_FAILED;
 
-    VkPipelineStageFlags presentStage = swapchain->useDri3 ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT :
-                                                             VK_PIPELINE_STAGE_TRANSFER_BIT;
-    vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, presentStage,
-                                       0, 0, NULL, 0, NULL, 1, &barrier);
+        VkImageMemoryBarrier barriers[2] = {0};
+        for (int i = 0; i < ARRAY_SIZE(barriers); i++) {
+            barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barriers[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barriers[i].subresourceRange.baseMipLevel = 0;
+            barriers[i].subresourceRange.levelCount = 1;
+            barriers[i].subresourceRange.baseArrayLayer = 0;
+            barriers[i].subresourceRange.layerCount = 1;
+        }
 
-    if (!swapchain->useDri3) {
-        VkBufferImageCopy region = {0};
-        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.imageSubresource.mipLevel = 0;
-        region.imageSubresource.baseArrayLayer = 0;
-        region.imageSubresource.layerCount = 1;
-        region.imageExtent.width = swapchain->imageExtent.width;
-        region.imageExtent.height = swapchain->imageExtent.height;
-        region.imageExtent.depth = 1;
+        barriers[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barriers[0].image = swapchainImage->image;
 
-        vulkanWrapper.vkCmdCopyImageToBuffer(commandBuffer, swapchainImage->image,
-                                             VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                             swapchainImage->readbackBuffer, 1, &region);
+        barriers[1].srcAccessMask = swapchainImage->dri3PresentImageInitialized ?
+                                    VK_ACCESS_MEMORY_READ_BIT : 0;
+        barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barriers[1].oldLayout = swapchainImage->dri3PresentImageInitialized ?
+                                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_UNDEFINED;
+        barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barriers[1].image = swapchainImage->dri3PresentImage;
 
-        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                           VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                           0, 0, NULL, 0, NULL, ARRAY_SIZE(barriers), barriers);
 
+        VkImageCopy region = {0};
+        region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.srcSubresource.layerCount = 1;
+        region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.dstSubresource.layerCount = 1;
+        region.extent.width = swapchain->imageExtent.width;
+        region.extent.height = swapchain->imageExtent.height;
+        region.extent.depth = 1;
+        vulkanWrapper.vkCmdCopyImage(commandBuffer, swapchainImage->image,
+                                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                     swapchainImage->dri3PresentImage,
+                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+        barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+        barriers[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+        barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
         vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                           0, 0, NULL, 0, NULL, ARRAY_SIZE(barriers), barriers);
+        swapchainImage->dri3PresentImageInitialized = true;
+        presentStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    }
+    else {
+        VkImageMemoryBarrier barrier = {0};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        barrier.dstAccessMask = swapchain->useDri3 ? VK_ACCESS_MEMORY_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barrier.newLayout = swapchain->useDri3 ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR :
+                                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = swapchainImage->image;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.baseMipLevel = 0;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.baseArrayLayer = 0;
+        barrier.subresourceRange.layerCount = 1;
+
+        presentStage = swapchain->useDri3 ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT :
+                                            VK_PIPELINE_STAGE_TRANSFER_BIT;
+        vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, presentStage,
                                            0, 0, NULL, 0, NULL, 1, &barrier);
+
+        if (!swapchain->useDri3) {
+            VkBufferImageCopy region = {0};
+            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.imageSubresource.mipLevel = 0;
+            region.imageSubresource.baseArrayLayer = 0;
+            region.imageSubresource.layerCount = 1;
+            region.imageExtent.width = swapchain->imageExtent.width;
+            region.imageExtent.height = swapchain->imageExtent.height;
+            region.imageExtent.depth = 1;
+
+            vulkanWrapper.vkCmdCopyImageToBuffer(commandBuffer, swapchainImage->image,
+                                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                                 swapchainImage->readbackBuffer, 1, &region);
+
+            barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+            vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                               0, 0, NULL, 0, NULL, 1, &barrier);
+        }
     }
 
     result = vulkanWrapper.vkEndCommandBuffer(commandBuffer);

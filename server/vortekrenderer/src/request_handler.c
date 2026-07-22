@@ -164,8 +164,8 @@ void vt_handle_vkCreateDevice(VkContext* context) {
                      extraExtensions, ARRAY_SIZE(extraExtensions),
                      globalImplementedDeviceExtensions, ARRAY_SIZE(globalImplementedDeviceExtensions));
 
-    /* DMA-BUF image export is optional. Enable its extension only for devices
-     * which advertise the handle type so X11 can use the DRI3 fast path. */
+    /* DMA-BUF remains optional for client-visible resource-memory transport.
+     * The CLI X11 DRI3 path uses Android hardware buffers instead. */
     if (context->hasExternalMemoryDMABuf) {
         const char* dmaBufExtension[] = {VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME};
         injectExtensions(context, (char***)&createInfo.ppEnabledExtensionNames, &createInfo.enabledExtensionCount,
@@ -2126,7 +2126,7 @@ void vt_handle_vkCreateSwapchainKHR(VkContext* context) {
 
     XWindowSwapchain* swapchain = NULL;
     if (createInfo.imageExtent.width == windowSize.width && createInfo.imageExtent.height == windowSize.height) {
-        swapchain = XWindowSwapchain_create(device, context->graphicsQueueIndex, &createInfo, &context->jmethods, windowId);
+        swapchain = XWindowSwapchain_create(device, context->physicalDevice, context->graphicsQueueIndex, &createInfo, &context->jmethods, windowId);
         if (!swapchain) result = VK_ERROR_INITIALIZATION_FAILED;
     }
     else result = VK_ERROR_SURFACE_LOST_KHR;
