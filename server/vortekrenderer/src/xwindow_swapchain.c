@@ -81,6 +81,29 @@ static bool getX11WindowExtent(uint64_t windowId, VkExtent2D* extent) {
     return true;
 }
 
+static void processX11WindowEvents(XWindowSwapchain* swapchain) {
+    if (!swapchain || !swapchain->x11Display || swapchain->x11Window == 0) return;
+
+    Display* display = (Display*)swapchain->x11Display;
+    Window window = (Window)swapchain->x11Window;
+    XEvent event;
+
+    pthread_mutex_lock(&globalX11Mutex);
+    while (XCheckWindowEvent(display, window, StructureNotifyMask, &event)) {
+        if (event.type == ConfigureNotify) {
+            XConfigureEvent* configure = &event.xconfigure;
+            if (configure->width > 0 && configure->height > 0) {
+                swapchain->x11WindowExtent.width = (uint32_t)configure->width;
+                swapchain->x11WindowExtent.height = (uint32_t)configure->height;
+            }
+        }
+        else if (event.type == DestroyNotify) {
+            swapchain->x11WindowLost = true;
+        }
+    }
+    pthread_mutex_unlock(&globalX11Mutex);
+}
+
 static int maskShift(unsigned long mask) {
     int shift = 0;
     while (mask && ((mask & 1) == 0)) {
@@ -204,6 +227,15 @@ static bool createX11Image(XWindowSwapchain* swapchain) {
     Status status = XGetWindowAttributes(display, (Window)swapchain->windowId, &attrs);
     bool x11Success = endX11ErrorTrap(display);
     if (!x11Success || !status || attrs.width <= 0 || attrs.height <= 0) return false;
+    if (swapchain->imageExtent.width != (uint32_t)attrs.width ||
+        swapchain->imageExtent.height != (uint32_t)attrs.height) {
+        return false;
+    }
+
+    beginX11ErrorTrap(display);
+    XSelectInput(display, (Window)swapchain->windowId, attrs.your_event_mask | StructureNotifyMask);
+    bool selectSuccess = endX11ErrorTrap(display);
+    if (!selectSuccess) return false;
 
     int screen = attrs.screen ? XScreenNumberOfScreen(attrs.screen) : DefaultScreen(display);
     Visual* visual = attrs.visual ? attrs.visual : DefaultVisual(display, screen);
@@ -228,6 +260,8 @@ static bool createX11Image(XWindowSwapchain* swapchain) {
     swapchain->x11GC = gc;
     swapchain->x11ShmInfo = shmInfo;
     swapchain->x11Window = (Window)swapchain->windowId;
+    swapchain->x11WindowExtent.width = (uint32_t)attrs.width;
+    swapchain->x11WindowExtent.height = (uint32_t)attrs.height;
     return true;
 }
 #endif
@@ -597,12 +631,10 @@ VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t
     if (!imageIndex) return VK_ERROR_INITIALIZATION_FAILED;
 
     if (!XWindowSwapchain_hasWindowProvider(swapchain->jmethods)) {
-        VkExtent2D windowSize;
-        if (!XWindowSwapchain_getWindowExtent(swapchain->jmethods, swapchain->windowId, &windowSize)) {
-            return VK_ERROR_SURFACE_LOST_KHR;
-        }
-
-        if (swapchain->imageExtent.width != windowSize.width || swapchain->imageExtent.height != windowSize.height) {
+        processX11WindowEvents(swapchain);
+        if (swapchain->x11WindowLost ||
+            swapchain->imageExtent.width != swapchain->x11WindowExtent.width ||
+            swapchain->imageExtent.height != swapchain->x11WindowExtent.height) {
             return VK_ERROR_SURFACE_LOST_KHR;
         }
 
@@ -673,6 +705,15 @@ VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t
                 pthread_mutex_unlock(&swapchain->presentMutex);
                 return VK_ERROR_INITIALIZATION_FAILED;
             }
+
+            pthread_mutex_unlock(&swapchain->presentMutex);
+            processX11WindowEvents(swapchain);
+            if (swapchain->x11WindowLost ||
+                swapchain->imageExtent.width != swapchain->x11WindowExtent.width ||
+                swapchain->imageExtent.height != swapchain->x11WindowExtent.height) {
+                return VK_ERROR_SURFACE_LOST_KHR;
+            }
+            pthread_mutex_lock(&swapchain->presentMutex);
         }
     }
 #endif
@@ -855,7 +896,7 @@ static bool uploadReadbackToX11(XWindowSwapchain* swapchain, XWindowSwapchain_Im
     uint32_t height = swapchain->imageExtent.height;
 
     Display* display = (Display*)swapchain->x11Display;
-    beginX11ErrorTrap(display);
+    pthread_mutex_lock(&globalX11Mutex);
     bool submitted;
     if (swapchain->x11ShmInfo) {
         submitted = XShmPutImage(display, (Window)swapchain->x11Window, (GC)swapchain->x11GC,
@@ -867,8 +908,8 @@ static bool uploadReadbackToX11(XWindowSwapchain* swapchain, XWindowSwapchain_Im
         submitted = true;
     }
     XFlush(display);
-    bool x11Succeeded = endX11ErrorTrap(display);
-    return submitted && x11Succeeded;
+    pthread_mutex_unlock(&globalX11Mutex);
+    return submitted;
 }
 
 static void releaseCliImageLocked(XWindowSwapchain* swapchain, uint32_t imageIndex) {

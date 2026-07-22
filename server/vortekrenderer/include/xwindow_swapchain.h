@@ -49,6 +49,8 @@ typedef struct XWindowSwapchain {
     void* x11GC;
     void* x11ShmInfo;
     unsigned long x11Window;
+    VkExtent2D x11WindowExtent;
+    bool x11WindowLost;
 #endif
 } XWindowSwapchain;
 
