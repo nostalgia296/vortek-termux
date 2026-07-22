@@ -51,6 +51,7 @@ typedef struct XWindowSwapchain {
     bool presentThreadRunning;
     bool presentThreadStop;
     bool useDri3;
+    int presentWakeFd;
     uint32_t* presentQueue;
     int presentQueueHead;
     int presentQueueCount;

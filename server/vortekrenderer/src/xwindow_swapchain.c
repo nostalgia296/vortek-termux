@@ -12,6 +12,7 @@
 #include <xcb/sync.h>
 #include <errno.h>
 #include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <time.h>
@@ -1053,6 +1054,9 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, VkPhysicalDevice phys
 
     swapchain->windowId = windowId;
     swapchain->jmethods = jmethods;
+#ifdef VORTEK_CLI_X11
+    swapchain->presentWakeFd = -1;
+#endif
     swapchain->imageCount = swapchainInfo->minImageCount;
     if (swapchain->imageCount <= 0) swapchain->imageCount = getSurfaceMinImageCount();
 #ifdef VORTEK_CLI_X11
@@ -1486,12 +1490,11 @@ static VkResult presentDri3Pixmap(XWindowSwapchain* swapchain, uint32_t imageInd
     swapchainImage->presentSerial = serial;
     xshmfence_reset((struct xshmfence*)swapchainImage->xcbShmFence);
 
-    xcb_void_cookie_t cookie = xcb_present_pixmap_checked(
+    xcb_present_pixmap(
         connection, (xcb_window_t)swapchain->x11Window, swapchainImage->xcbPixmap, serial,
         XCB_NONE, XCB_NONE, 0, 0, XCB_NONE, XCB_NONE, swapchainImage->xcbSyncFence,
         XCB_PRESENT_OPTION_COPY, 0, 0, 0, 0, NULL);
-    xcb_flush(connection);
-    if (!xcbRequestSucceeded(connection, cookie)) {
+    if (xcb_flush(connection) <= 0) {
         swapchainImage->presentSerial = 0;
         return VK_ERROR_SURFACE_LOST_KHR;
     }
@@ -1559,6 +1562,55 @@ static bool processDri3Events(XWindowSwapchain* swapchain, bool blockForIdle) {
     }
 }
 
+static void wakeCliPresentThread(XWindowSwapchain* swapchain) {
+    if (swapchain->presentWakeFd >= 0) {
+        eventfd_t value = 1;
+        (void)eventfd_write(swapchain->presentWakeFd, value);
+    }
+    else {
+        pthread_cond_signal(&swapchain->presentCond);
+    }
+}
+
+static bool waitForDri3EventOrPresent(XWindowSwapchain* swapchain) {
+    xcb_connection_t* connection = (xcb_connection_t*)swapchain->xcbConnection;
+    if (!connection || swapchain->presentWakeFd < 0) return false;
+
+    struct pollfd pollFds[] = {
+        {.fd = xcb_get_file_descriptor(connection), .events = POLLIN},
+        {.fd = swapchain->presentWakeFd, .events = POLLIN}
+    };
+    int pollResult;
+    do {
+        pollResult = poll(pollFds, ARRAY_SIZE(pollFds), -1);
+    } while (pollResult < 0 && errno == EINTR);
+
+    if (pollResult <= 0 ||
+        (pollFds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) ||
+        (pollFds[1].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+        failDri3Presentation(swapchain);
+        return false;
+    }
+
+    if (pollFds[1].revents & POLLIN) {
+        eventfd_t value;
+        while (eventfd_read(swapchain->presentWakeFd, &value) == 0) {
+        }
+    }
+    if (pollFds[0].revents & POLLIN) {
+        (void)processDri3Events(swapchain, false);
+    }
+    if (xcb_connection_has_error(connection)) {
+        failDri3Presentation(swapchain);
+        return false;
+    }
+
+    pthread_mutex_lock(&swapchain->presentMutex);
+    bool presentationHealthy = swapchain->presentStatus == VK_SUCCESS;
+    pthread_mutex_unlock(&swapchain->presentMutex);
+    return presentationHealthy;
+}
+
 static VkResult getCliPresentStatus(XWindowSwapchain* swapchain, uint32_t imageIndex) {
     VkResult status = VK_SUCCESS;
 
@@ -1584,7 +1636,7 @@ static VkResult enqueueCliPresentImage(XWindowSwapchain* swapchain, uint32_t ima
         swapchain->presentQueue[queueIndex] = imageIndex;
         swapchain->presentQueueCount++;
         swapchain->images[imageIndex].presentQueued = true;
-        pthread_cond_signal(&swapchain->presentCond);
+        wakeCliPresentThread(swapchain);
     }
 
     pthread_mutex_unlock(&swapchain->presentMutex);
@@ -1625,10 +1677,11 @@ static void* cliPresentThreadMain(void* param) {
     while (true) {
         pthread_mutex_lock(&swapchain->presentMutex);
         while (swapchain->presentQueueCount == 0 && !swapchain->presentThreadStop) {
-            if (swapchain->useDri3 && swapchain->presentPendingCount > 0) {
+            if (swapchain->useDri3) {
                 pthread_mutex_unlock(&swapchain->presentMutex);
-                (void)processDri3Events(swapchain, true);
+                bool waitSucceeded = waitForDri3EventOrPresent(swapchain);
                 pthread_mutex_lock(&swapchain->presentMutex);
+                if (!waitSucceeded) swapchain->presentThreadStop = true;
                 continue;
             }
             pthread_cond_wait(&swapchain->presentCond, &swapchain->presentMutex);
@@ -1637,7 +1690,7 @@ static void* cliPresentThreadMain(void* param) {
         if (swapchain->presentQueueCount == 0 && swapchain->presentThreadStop) {
             if (swapchain->useDri3 && swapchain->presentPendingCount > 0) {
                 pthread_mutex_unlock(&swapchain->presentMutex);
-                (void)processDri3Events(swapchain, true);
+                (void)waitForDri3EventOrPresent(swapchain);
                 continue;
             }
             pthread_mutex_unlock(&swapchain->presentMutex);
@@ -1673,7 +1726,12 @@ static VkResult startCliPresentThread(XWindowSwapchain* swapchain) {
     swapchain->presentQueue = calloc(swapchain->imageCount, sizeof(uint32_t));
     if (!swapchain->presentQueue) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-    if (pthread_mutex_init(&swapchain->presentMutex, NULL) != 0) goto error_free_queue;
+    if (swapchain->useDri3) {
+        swapchain->presentWakeFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (swapchain->presentWakeFd < 0) goto error_free_queue;
+    }
+
+    if (pthread_mutex_init(&swapchain->presentMutex, NULL) != 0) goto error_close_wake_fd;
     if (pthread_cond_init(&swapchain->presentCond, NULL) != 0) goto error_destroy_mutex;
     if (pthread_cond_init(&swapchain->imageAvailableCond, NULL) != 0) goto error_destroy_present_cond;
 
@@ -1691,6 +1749,9 @@ error_destroy_present_cond:
     pthread_cond_destroy(&swapchain->presentCond);
 error_destroy_mutex:
     pthread_mutex_destroy(&swapchain->presentMutex);
+error_close_wake_fd:
+    if (swapchain->presentWakeFd >= 0) close(swapchain->presentWakeFd);
+    swapchain->presentWakeFd = -1;
 error_free_queue:
     MEMFREE(swapchain->presentQueue);
     return VK_ERROR_INITIALIZATION_FAILED;
@@ -1701,7 +1762,7 @@ static void stopCliPresentThread(XWindowSwapchain* swapchain) {
 
     pthread_mutex_lock(&swapchain->presentMutex);
     swapchain->presentThreadStop = true;
-    pthread_cond_signal(&swapchain->presentCond);
+    wakeCliPresentThread(swapchain);
     pthread_mutex_unlock(&swapchain->presentMutex);
 
     if (swapchain->presentThreadRunning) {
@@ -1712,6 +1773,8 @@ static void stopCliPresentThread(XWindowSwapchain* swapchain) {
     pthread_cond_destroy(&swapchain->imageAvailableCond);
     pthread_cond_destroy(&swapchain->presentCond);
     pthread_mutex_destroy(&swapchain->presentMutex);
+    if (swapchain->presentWakeFd >= 0) close(swapchain->presentWakeFd);
+    swapchain->presentWakeFd = -1;
     MEMFREE(swapchain->presentQueue);
     swapchain->presentSyncInitialized = false;
 }
