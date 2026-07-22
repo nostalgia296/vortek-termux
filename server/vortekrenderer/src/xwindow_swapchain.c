@@ -995,6 +995,7 @@ static void destroyCliImage(VkDevice device, XWindowSwapchain* swapchain,
     swapchainImage->dri3PresentMemory = VK_NULL_HANDLE;
     swapchainImage->dri3Blit = false;
     swapchainImage->dri3PresentImageInitialized = false;
+    swapchainImage->presentCommandBufferReusable = false;
     swapchainImage->readbackData = NULL;
     swapchainImage->readbackBuffer = VK_NULL_HANDLE;
     swapchainImage->readbackMemory = VK_NULL_HANDLE;
@@ -1022,7 +1023,8 @@ static void destroyCliCommandResources(VkDevice device, XWindowSwapchain* swapch
 
 int getSurfaceMinImageCount() {
 #ifdef VORTEK_CLI_X11
-    return 2;
+    /* Keep CPU rendering, GPU work, and X11 presentation pipelined. */
+    return 3;
 #else
     return 1;
 #endif
@@ -1632,11 +1634,12 @@ static VkResult enqueueCliPresentImage(XWindowSwapchain* swapchain, uint32_t ima
     else if (!swapchain->images[imageIndex].acquired || swapchain->images[imageIndex].presentQueued) result = VK_NOT_READY;
     else if (swapchain->presentQueueCount >= swapchain->imageCount) result = VK_NOT_READY;
     else {
+        bool queueWasEmpty = swapchain->presentQueueCount == 0;
         int queueIndex = (swapchain->presentQueueHead + swapchain->presentQueueCount) % swapchain->imageCount;
         swapchain->presentQueue[queueIndex] = imageIndex;
         swapchain->presentQueueCount++;
         swapchain->images[imageIndex].presentQueued = true;
-        wakeCliPresentThread(swapchain);
+        if (queueWasEmpty) wakeCliPresentThread(swapchain);
     }
 
     pthread_mutex_unlock(&swapchain->presentMutex);
@@ -1793,127 +1796,129 @@ static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex
 
     VkDevice device = swapchain->device;
     VkCommandBuffer commandBuffer = swapchainImage->commandBuffer;
+    bool recordCommandBuffer = !swapchainImage->presentCommandBufferReusable;
+    bool dri3PresentImageWasInitialized = swapchainImage->dri3PresentImageInitialized;
+    VkPipelineStageFlags presentStage = (swapchain->useDri3 && !swapchainImage->dri3Blit) ?
+                                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT :
+                                        VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkResult result;
 
-    VkResult result = vulkanWrapper.vkResetCommandBuffer(commandBuffer, 0);
-    if (result != VK_SUCCESS) return result;
+    if (recordCommandBuffer) {
+        result = vulkanWrapper.vkResetCommandBuffer(commandBuffer, 0);
+        if (result != VK_SUCCESS) return result;
 
-    VkCommandBufferBeginInfo beginInfo = {0};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        VkCommandBufferBeginInfo beginInfo = {0};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 
-    result = vulkanWrapper.vkBeginCommandBuffer(commandBuffer, &beginInfo);
-    if (result != VK_SUCCESS) return result;
+        result = vulkanWrapper.vkBeginCommandBuffer(commandBuffer, &beginInfo);
+        if (result != VK_SUCCESS) return result;
 
-    VkPipelineStageFlags presentStage;
-    if (swapchain->useDri3 && swapchainImage->dri3Blit) {
-        if (!swapchainImage->dri3PresentImage) return VK_ERROR_INITIALIZATION_FAILED;
+        if (swapchain->useDri3 && swapchainImage->dri3Blit) {
+            if (!swapchainImage->dri3PresentImage) return VK_ERROR_INITIALIZATION_FAILED;
 
-        VkImageMemoryBarrier barriers[2] = {0};
-        for (int i = 0; i < ARRAY_SIZE(barriers); i++) {
-            barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barriers[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barriers[i].subresourceRange.baseMipLevel = 0;
-            barriers[i].subresourceRange.levelCount = 1;
-            barriers[i].subresourceRange.baseArrayLayer = 0;
-            barriers[i].subresourceRange.layerCount = 1;
-        }
+            VkImageMemoryBarrier barriers[2] = {0};
+            for (int i = 0; i < ARRAY_SIZE(barriers); i++) {
+                barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                barriers[i].subresourceRange.baseMipLevel = 0;
+                barriers[i].subresourceRange.levelCount = 1;
+                barriers[i].subresourceRange.baseArrayLayer = 0;
+                barriers[i].subresourceRange.layerCount = 1;
+            }
 
-        barriers[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-        barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        barriers[0].image = swapchainImage->image;
+            barriers[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barriers[0].image = swapchainImage->image;
 
-        barriers[1].srcAccessMask = swapchainImage->dri3PresentImageInitialized ?
-                                    VK_ACCESS_MEMORY_READ_BIT : 0;
-        barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barriers[1].oldLayout = swapchainImage->dri3PresentImageInitialized ?
-                                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_UNDEFINED;
-        barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barriers[1].image = swapchainImage->dri3PresentImage;
+            barriers[1].srcAccessMask = dri3PresentImageWasInitialized ? VK_ACCESS_MEMORY_READ_BIT : 0;
+            barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barriers[1].oldLayout = dri3PresentImageWasInitialized ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR :
+                                                                    VK_IMAGE_LAYOUT_UNDEFINED;
+            barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barriers[1].image = swapchainImage->dri3PresentImage;
 
-        vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                           VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                           0, 0, NULL, 0, NULL, ARRAY_SIZE(barriers), barriers);
+            vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                               0, 0, NULL, 0, NULL, ARRAY_SIZE(barriers), barriers);
 
-        VkImageCopy region = {0};
-        region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.srcSubresource.layerCount = 1;
-        region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.dstSubresource.layerCount = 1;
-        region.extent.width = swapchain->imageExtent.width;
-        region.extent.height = swapchain->imageExtent.height;
-        region.extent.depth = 1;
-        vulkanWrapper.vkCmdCopyImage(commandBuffer, swapchainImage->image,
-                                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                     swapchainImage->dri3PresentImage,
-                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+            VkImageCopy region = {0};
+            region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.srcSubresource.layerCount = 1;
+            region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.dstSubresource.layerCount = 1;
+            region.extent.width = swapchain->imageExtent.width;
+            region.extent.height = swapchain->imageExtent.height;
+            region.extent.depth = 1;
+            vulkanWrapper.vkCmdCopyImage(commandBuffer, swapchainImage->image,
+                                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                         swapchainImage->dri3PresentImage,
+                                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
 
-        barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        barriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-        barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barriers[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-        barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                           0, 0, NULL, 0, NULL, ARRAY_SIZE(barriers), barriers);
-        swapchainImage->dri3PresentImageInitialized = true;
-        presentStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-    }
-    else {
-        VkImageMemoryBarrier barrier = {0};
-        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-        barrier.dstAccessMask = swapchain->useDri3 ? VK_ACCESS_MEMORY_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT;
-        barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        barrier.newLayout = swapchain->useDri3 ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR :
-                                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.image = swapchainImage->image;
-        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        barrier.subresourceRange.baseMipLevel = 0;
-        barrier.subresourceRange.levelCount = 1;
-        barrier.subresourceRange.baseArrayLayer = 0;
-        barrier.subresourceRange.layerCount = 1;
-
-        presentStage = swapchain->useDri3 ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT :
-                                            VK_PIPELINE_STAGE_TRANSFER_BIT;
-        vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, presentStage,
-                                           0, 0, NULL, 0, NULL, 1, &barrier);
-
-        if (!swapchain->useDri3) {
-            VkBufferImageCopy region = {0};
-            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            region.imageSubresource.mipLevel = 0;
-            region.imageSubresource.baseArrayLayer = 0;
-            region.imageSubresource.layerCount = 1;
-            region.imageExtent.width = swapchain->imageExtent.width;
-            region.imageExtent.height = swapchain->imageExtent.height;
-            region.imageExtent.depth = 1;
-
-            vulkanWrapper.vkCmdCopyImageToBuffer(commandBuffer, swapchainImage->image,
-                                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                                 swapchainImage->readbackBuffer, 1, &region);
-
-            barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-
+            barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+            barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barriers[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+            barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
             vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
                                                VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                               0, 0, NULL, 0, NULL, 1, &barrier);
+                                               0, 0, NULL, 0, NULL, ARRAY_SIZE(barriers), barriers);
         }
-    }
+        else {
+            VkImageMemoryBarrier barrier = {0};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            barrier.dstAccessMask = swapchain->useDri3 ? VK_ACCESS_MEMORY_READ_BIT :
+                                                        VK_ACCESS_TRANSFER_READ_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            barrier.newLayout = swapchain->useDri3 ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR :
+                                                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = swapchainImage->image;
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.baseMipLevel = 0;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.baseArrayLayer = 0;
+            barrier.subresourceRange.layerCount = 1;
 
-    result = vulkanWrapper.vkEndCommandBuffer(commandBuffer);
-    if (result != VK_SUCCESS) return result;
+            vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                               presentStage, 0, 0, NULL, 0, NULL, 1, &barrier);
+
+            if (!swapchain->useDri3) {
+                VkBufferImageCopy region = {0};
+                region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                region.imageSubresource.mipLevel = 0;
+                region.imageSubresource.baseArrayLayer = 0;
+                region.imageSubresource.layerCount = 1;
+                region.imageExtent.width = swapchain->imageExtent.width;
+                region.imageExtent.height = swapchain->imageExtent.height;
+                region.imageExtent.depth = 1;
+
+                vulkanWrapper.vkCmdCopyImageToBuffer(commandBuffer, swapchainImage->image,
+                                                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                                     swapchainImage->readbackBuffer, 1, &region);
+
+                barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+                barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+                vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                                   0, 0, NULL, 0, NULL, 1, &barrier);
+            }
+        }
+
+        result = vulkanWrapper.vkEndCommandBuffer(commandBuffer);
+        if (result != VK_SUCCESS) return result;
+    }
 
     VkSubmitInfo submitInfo = {0};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1932,6 +1937,17 @@ static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex
 
     result = vulkanWrapper.vkQueueSubmit(swapchain->queue, 1, &submitInfo, swapchainImage->presentFence);
     if (result != VK_SUCCESS) return result;
+
+    if (recordCommandBuffer) {
+        /* The imported AHB starts undefined. Record its steady-state layout once
+         * after the initial submission, then reuse that command buffer. */
+        if (swapchain->useDri3 && swapchainImage->dri3Blit && !dri3PresentImageWasInitialized) {
+            swapchainImage->dri3PresentImageInitialized = true;
+        }
+        else {
+            swapchainImage->presentCommandBufferReusable = true;
+        }
+    }
 
     result = enqueueCliPresentImage(swapchain, imageIndex);
     if (result != VK_SUCCESS) {

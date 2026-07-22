@@ -14,6 +14,7 @@ typedef struct XWindowSwapchain_Image {
     VkDeviceMemory dri3PresentMemory;
     bool dri3Blit;
     bool dri3PresentImageInitialized;
+    bool presentCommandBufferReusable;
     bool acquired;
     bool presentQueued;
     VkCommandBuffer commandBuffer;
