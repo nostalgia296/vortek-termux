@@ -1,0 +1,232 @@
+#version 450
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer InputBuffer {
+    uint input_pixels[];
+};
+layout(std430, set = 0, binding = 1) writeonly buffer OutputBuffer {
+    uint output_pixels[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint id;
+} constants;
+
+const uint FONT_COLUMNS[80] = uint[](
+        //  +++  //
+        // +   + //
+        // +   + //
+        // +   + //
+        // +   + //
+        // +   + //
+        //  +++  //
+        0x3E, 0x41, 0x41, 0x41, 0x3E, // 0 (idx 0)
+        //   +   //
+        //  ++   //
+        //   +   //
+        //   +   //
+        //   +   //
+        //   +   //
+        //  +++  //
+        0x00, 0x42, 0x7F, 0x40, 0x00, // 1 (idx 1)
+        //  +++  //
+        // +   + //
+        //     + //
+        //    +  //
+        //   +   //
+        //  +    //
+        // +++++ //
+        0x42, 0x61, 0x51, 0x49, 0x46, // 2 (idx 2)
+        //  +++  //
+        // +   + //
+        //     + //
+        //   ++  //
+        //     + //
+        // +   + //
+        //  +++  //
+        0x22, 0x41, 0x49, 0x49, 0x36, // 3 (idx 3)
+        //    +  //
+        //   ++  //
+        //  + +  //
+        // +  +  //
+        // +++++ //
+        //    +  //
+        //    +  //
+        0x18, 0x14, 0x12, 0x7F, 0x10, // 4 (idx 4)
+        // +++++ //
+        // +     //
+        // ++++  //
+        //     + //
+        //     + //
+        // +   + //
+        //  +++  //
+        0x27, 0x45, 0x45, 0x45, 0x39, // 5 (idx 5)
+        //  +++  //
+        // +     //
+        // +     //
+        // ++++  //
+        // +   + //
+        // +   + //
+        //  +++  //
+        0x3E, 0x49, 0x49, 0x49, 0x30, // 6 (idx 6)
+        // +++++ //
+        //     + //
+        //    +  //
+        //   +   //
+        //   +   //
+        //   +   //
+        //   +   //
+        0x01, 0x01, 0x79, 0x05, 0x03, // 7 (idx 7)
+        //  +++  //
+        // +   + //
+        // +   + //
+        //  +++  //
+        // +   + //
+        // +   + //
+        //  +++  //
+        0x36, 0x49, 0x49, 0x49, 0x36, // 8 (idx 8)
+        //  +++  //
+        // +   + //
+        // +   + //
+        //  ++++ //
+        //     + //
+        //     + //
+        //  +++  //
+        0x06, 0x49, 0x49, 0x49, 0x3E, // 9 (idx 9)
+        //       //
+        //       //
+        //  +++  //
+        //     + //
+        //  ++++ //
+        // +   + //
+        //  ++++ //
+        0x20, 0x54, 0x54, 0x54, 0x78, // a (idx 10)
+        // +     //
+        // +     //
+        // + ++  //
+        // ++  + //
+        // +   + //
+        // +   + //
+        // ++++  //
+        0x7F, 0x48, 0x44, 0x44, 0x38, // b (idx 11)
+        //       //
+        //       //
+        //  +++  //
+        // +   + //
+        // +     //
+        // +   + //
+        //  +++  //
+        0x38, 0x44, 0x44, 0x44, 0x28, // c (idx 12)
+        //     + //
+        //     + //
+        //  ++ + //
+        // +  ++ //
+        // +   + //
+        // +   + //
+        //  ++++ //
+        0x38, 0x44, 0x44, 0x48, 0x7F, // d (idx 13)
+        //       //
+        //       //
+        //  +++  //
+        // +   + //
+        // +++++ //
+        // +     //
+        //  +++  //
+        0x38, 0x54, 0x54, 0x54, 0x18, // e (idx 14)
+        //   ++  //
+        //  +  + //
+        //  +    //
+        // +++   //
+        //  +    //
+        //  +    //
+        //  +    //
+        0x08, 0x7E, 0x09, 0x01, 0x02 // f (idx 15)
+    );
+
+const uint OTHER_CHARACTERS[5] = uint[](
+        //       //
+        //       //
+        //       //
+        //  +++  //
+        //       //
+        //       //
+        //       //
+        0x08, 0x08, 0x08, 0x08, 0x08 // - (idx 0)
+    );
+
+int get_font_pixel(uint digit, ivec2 font_coord) {
+    if (font_coord.x < 0 || font_coord.x >= 5 || font_coord.y < 0 || font_coord.y >= 7) {
+        return 0;
+    }
+
+    uint column;
+    if (digit >= 256U && digit < 256U + 1U) {
+        column = OTHER_CHARACTERS[(digit - 256) * 5 + font_coord.x];
+    } else if (digit < 16U) {
+        column = FONT_COLUMNS[digit * 5 + font_coord.x];
+    } else {
+        return 0;
+    }
+
+    return int((column >> (6 - font_coord.y)) & 1U);
+}
+
+void main() {
+    ivec2 pixel_coord = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel_coord.x >= int(constants.width) || pixel_coord.y >= int(constants.height)) {
+        return;
+    }
+
+    uint linear_index = uint(pixel_coord.y * int(constants.width) + pixel_coord.x);
+    uint raw_input_color = input_pixels[linear_index];
+    vec4 final_color = unpackUnorm4x8(raw_input_color);
+
+    int glyph_spacing = 6;
+    int watermark_width = 7 * glyph_spacing;
+    int tile_width = watermark_width + 4 * glyph_spacing * 2;
+    int tile_height = 56;
+
+    int tile_x = pixel_coord.x / tile_width;
+    int tile_y = pixel_coord.y / tile_height;
+    int local_x = pixel_coord.x % tile_width;
+    int local_y = pixel_coord.y % tile_height;
+
+    bool should_draw = false;
+    if (local_y < 7) {
+        should_draw = true;
+    }
+    if (should_draw && local_x < watermark_width) {
+        int slot = local_x / glyph_spacing;
+        ivec2 font_coord = ivec2(local_x % glyph_spacing, 7 - local_y % 7);
+
+        uint value = constants.id & 0xFFFFU;
+        uint format = (constants.id >> 16) & 0xFFU;
+        uint digit = 0xFFFFU;
+        if (slot == 0) digit = (value / 0x1000U) % 16U;
+        if (slot == 1) digit = (value / 0x100U) % 16U;
+        if (slot == 2) digit = (value / 0x10U) % 16U;
+        if (slot == 3) digit = value % 16U;
+        if (slot == 4) digit = 256; // dash
+        if (slot == 5) digit = (format / 16U) % 16U;
+        if (slot == 6) digit = format % 16U;
+
+        if (get_font_pixel(digit, font_coord) == 1) {
+            final_color = vec4(1.0, 1.0, 1.0, 1.0);
+        } else {
+            final_color = vec4(0.0, 0.0, 0.0, 1.0);
+        }
+    }
+
+    // Border with a corner on the bottom right for orientation (in case the texture is flipped)
+    if (local_y == 7 && local_x < watermark_width) {
+        final_color = vec4(1, 1, 1, 1.0);
+    }
+    if (local_x == watermark_width + 1 && local_y < 8) {
+        final_color = vec4(1, 1, 1, 1.0);
+    }
+
+    output_pixels[linear_index] = packUnorm4x8(final_color);
+}

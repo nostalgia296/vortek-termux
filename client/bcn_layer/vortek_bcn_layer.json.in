@@ -1,0 +1,21 @@
+{
+  "file_format_version": "1.0.0",
+  "layer": {
+    "name": "VK_LAYER_VORTEK_BCN",
+    "type": "GLOBAL",
+    "library_path": "@LAYER_LIBRARY_PATH@",
+    "api_version": "1.3.0",
+    "implementation_version": "1",
+    "description": "Vortek BC1-7 GPU decompression layer",
+    "functions": {
+      "vkGetInstanceProcAddr": "BCnLayer_GetInstanceProcAddr",
+      "vkGetDeviceProcAddr": "BCnLayer_GetDeviceProcAddr"
+    },
+    "enable_environment": {
+      "ENABLE_VORTEK_BCN_COMPUTE": "1"
+    },
+    "disable_environment": {
+      "DISABLE_VORTEK_BCN_COMPUTE": "1"
+    }
+  }
+}
