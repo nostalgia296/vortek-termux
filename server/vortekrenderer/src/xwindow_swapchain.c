@@ -12,6 +12,7 @@
 #include <xcb/sync.h>
 #include <errno.h>
 #include <poll.h>
+#include <sys/eventfd.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <time.h>
@@ -19,8 +20,15 @@
 /* Termux:X11 private DRI3 modifier: the only plane FD is an AHB socket. */
 #define TERMUX_X11_AHARDWAREBUFFER_SOCKET_MODIFIER UINT64_C(1255)
 #define TERMUX_X11_AHARDWAREBUFFER_HANDSHAKE_TIMEOUT_MS 5000
-/* Android's public NDK header does not expose this HAL format constant. */
-#define AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM 5
+#define TERMUX_X11_AHARDWAREBUFFER_FORMAT_BGRA8888 5
+
+enum {
+    DRI3_IMAGE_PATH_UNSELECTED,
+    DRI3_IMAGE_PATH_DIRECT,
+    DRI3_IMAGE_PATH_BLIT
+};
+
+#define PRESENT_WINDOW_DESTROYED (1u << 0)
 
 #if defined(__aarch64__) || defined(__ARM_NEON)
 #include <arm_neon.h>
@@ -38,6 +46,7 @@ static void* cliPresentThreadMain(void* param);
 static void releaseCliImage(XWindowSwapchain* swapchain, uint32_t imageIndex);
 static void destroyCliImage(VkDevice device, XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage);
 static void destroyCliCommandResources(VkDevice device, XWindowSwapchain* swapchain);
+static VkResult createDri3Pixmap(XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage);
 
 static int handleX11Error(Display* display, XErrorEvent* event) {
     (void)display;
@@ -148,9 +157,13 @@ static bool isX11Dri3Enabled() {
            vulkanWrapper.vkGetPhysicalDeviceImageFormatProperties2 != NULL;
 }
 
-static void logDri3(const char* format, ...) {
+static bool isDri3DebugEnabled() {
     const char* value = getenv("VORTEK_CLI_X11_DRI3_DEBUG");
-    if (!value || !value[0] || strcmp(value, "0") == 0) return;
+    return value && value[0] && strcmp(value, "0") != 0;
+}
+
+static void logDri3(const char* format, ...) {
+    if (!isDri3DebugEnabled()) return;
 
     va_list args;
     va_start(args, format);
@@ -299,8 +312,7 @@ static bool createX11Image(XWindowSwapchain* swapchain) {
 }
 
 static bool isDri3FormatSupported(VkFormat format) {
-    return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB ||
-           format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB;
+    return format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB;
 }
 
 static bool xcbRequestSucceeded(xcb_connection_t* connection, xcb_void_cookie_t cookie) {
@@ -348,11 +360,6 @@ static bool createXcbDri3State(XWindowSwapchain* swapchain) {
         return false;
     }
 
-    beginX11ErrorTrap(display);
-    XSelectInput(display, (Window)swapchain->windowId, attrs.your_event_mask | StructureNotifyMask);
-    bool selectSuccess = endX11ErrorTrap(display);
-    if (!selectSuccess) return false;
-
     int screenNumber = 0;
     xcb_connection_t* connection = xcb_connect(NULL, &screenNumber);
     if (!connection || xcb_connection_has_error(connection)) {
@@ -384,10 +391,35 @@ static bool createXcbDri3State(XWindowSwapchain* swapchain) {
     free(presentVersion);
     if (!hasPresent) goto error;
 
+    errorReply = NULL;
+    xcb_present_query_capabilities_reply_t* capabilitiesReply =
+        xcb_present_query_capabilities_reply(
+            connection,
+            xcb_present_query_capabilities(connection, (xcb_window_t)swapchain->windowId),
+            &errorReply);
+    uint32_t presentCapabilities = !errorReply && capabilitiesReply ?
+                                   capabilitiesReply->capabilities : 0;
+    free(errorReply);
+    free(capabilitiesReply);
+
+    uint32_t presentOptions = XCB_PRESENT_OPTION_NONE;
+    if (swapchain->presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR ||
+        swapchain->presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR) {
+        presentOptions |= XCB_PRESENT_OPTION_ASYNC;
+    }
+    if (swapchain->presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR &&
+        (presentCapabilities & XCB_PRESENT_CAPABILITY_ASYNC_MAY_TEAR)) {
+        presentOptions |= XCB_PRESENT_OPTION_ASYNC_MAY_TEAR;
+    }
+
+    uint32_t presentEventMask = XCB_PRESENT_EVENT_MASK_CONFIGURE_NOTIFY |
+                                XCB_PRESENT_EVENT_MASK_IDLE_NOTIFY;
+    if (isDri3DebugEnabled()) presentEventMask |= XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY;
+
     xcb_present_event_t presentEvent = xcb_generate_id(connection);
     xcb_void_cookie_t selectCookie = xcb_present_select_input_checked(
         connection, presentEvent, (xcb_window_t)swapchain->windowId,
-        XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY | XCB_PRESENT_EVENT_MASK_IDLE_NOTIFY);
+        presentEventMask);
     if (!xcbRequestSucceeded(connection, selectCookie)) goto error;
 
     swapchain->x11Display = display;
@@ -399,7 +431,10 @@ static bool createXcbDri3State(XWindowSwapchain* swapchain) {
     swapchain->xcbConnection = connection;
     swapchain->xcbPresentEvent = presentEvent;
     swapchain->xcbPresentOpcode = presentExtension->major_opcode;
+    swapchain->xcbPresentOptions = presentOptions;
     swapchain->useDri3 = true;
+    logDri3("Present capabilities=0x%x options=0x%x mode=%d",
+            presentCapabilities, presentOptions, swapchain->presentMode);
     return true;
 
 error:
@@ -574,11 +609,9 @@ static bool getDri3HardwareBufferFormat(VkFormat imageFormat, uint32_t* ahbForma
     switch (imageFormat) {
         case VK_FORMAT_B8G8R8A8_UNORM:
         case VK_FORMAT_B8G8R8A8_SRGB:
-            *ahbFormat = AHARDWAREBUFFER_FORMAT_B8G8R8A8_UNORM;
-            *vkFormat = VK_FORMAT_B8G8R8A8_UNORM;
-            return true;
-        case VK_FORMAT_R8G8B8A8_UNORM:
-        case VK_FORMAT_R8G8B8A8_SRGB:
+            /* Termux:X11 exposes an ARGB8888 pixmap and applies the required
+             * channel swap when its imported AHB is RGBA. Keep the presentation
+             * buffer RGBA so BGRA swapchains use that well-tested copy path. */
             *ahbFormat = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
             *vkFormat = VK_FORMAT_R8G8B8A8_UNORM;
             return true;
@@ -587,9 +620,14 @@ static bool getDri3HardwareBufferFormat(VkFormat imageFormat, uint32_t* ahbForma
     }
 }
 
-static uint64_t getDri3HardwareBufferUsage(XWindowSwapchain* swapchain, VkFormat format,
-                                            VkImageTiling tiling, VkImageUsageFlags usage) {
-    if (!swapchain->physicalDevice || !vulkanWrapper.vkGetPhysicalDeviceImageFormatProperties2) return 0;
+static VkResult getDri3HardwareBufferUsage(XWindowSwapchain* swapchain, VkFormat format,
+                                            VkImageTiling tiling, VkImageUsageFlags usage,
+                                            VkImageCreateFlags flags, uint64_t* hardwareBufferUsage) {
+    if (!hardwareBufferUsage) return VK_ERROR_INITIALIZATION_FAILED;
+    *hardwareBufferUsage = 0;
+    if (!swapchain->physicalDevice || !vulkanWrapper.vkGetPhysicalDeviceImageFormatProperties2) {
+        return VK_ERROR_EXTENSION_NOT_PRESENT;
+    }
 
     VkPhysicalDeviceExternalImageFormatInfo externalInfo = {0};
     externalInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO;
@@ -602,6 +640,7 @@ static uint64_t getDri3HardwareBufferUsage(XWindowSwapchain* swapchain, VkFormat
     imageFormatInfo.type = VK_IMAGE_TYPE_2D;
     imageFormatInfo.tiling = tiling;
     imageFormatInfo.usage = usage;
+    imageFormatInfo.flags = flags;
 
     VkAndroidHardwareBufferUsageANDROID ahbUsage = {0};
     ahbUsage.sType = VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_USAGE_ANDROID;
@@ -612,16 +651,19 @@ static uint64_t getDri3HardwareBufferUsage(XWindowSwapchain* swapchain, VkFormat
 
     VkResult result = vulkanWrapper.vkGetPhysicalDeviceImageFormatProperties2(
         swapchain->physicalDevice, &imageFormatInfo, &imageFormatProperties);
-    return result == VK_SUCCESS ? ahbUsage.androidHardwareBufferUsage : 0;
+    if (result == VK_SUCCESS) *hardwareBufferUsage = ahbUsage.androidHardwareBufferUsage;
+    return result;
 }
 
 static VkResult allocateDri3HardwareBuffer(XWindowSwapchain* swapchain,
                                             XWindowSwapchain_Image* swapchainImage,
-                                            uint32_t ahbFormat, VkFormat presentFormat) {
-    uint64_t usage = getDri3HardwareBufferUsage(swapchain, swapchain->imageFormat,
-                                                VK_IMAGE_TILING_OPTIMAL, swapchain->imageUsage);
-    usage |= getDri3HardwareBufferUsage(swapchain, presentFormat, VK_IMAGE_TILING_LINEAR,
-                                        VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+                                            uint32_t ahbFormat, VkFormat imageFormat,
+                                            VkImageTiling tiling, VkImageUsageFlags imageUsage,
+                                            VkImageCreateFlags imageFlags) {
+    uint64_t usage;
+    VkResult result = getDri3HardwareBufferUsage(swapchain, imageFormat, tiling,
+                                                  imageUsage, imageFlags, &usage);
+    if (result != VK_SUCCESS) return result;
     usage |= AHARDWAREBUFFER_USAGE_GPU_FRAMEBUFFER | AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE |
              AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN | AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN;
     usage &= ~AHARDWAREBUFFER_USAGE_GPU_DATA_BUFFER;
@@ -655,15 +697,25 @@ static VkResult getDri3HardwareBufferProperties(VkDevice device, AHardwareBuffer
 
 static VkResult createDri3AhbImage(VkDevice device, XWindowSwapchain* swapchain,
                                    AHardwareBuffer* hardwareBuffer, VkFormat format,
-                                   VkImageTiling tiling, VkImageUsageFlags usage,
+                                   VkFormat viewFormat, VkImageTiling tiling, VkImageUsageFlags usage,
                                    VkImage* image, VkDeviceMemory* memory) {
     VkExternalMemoryImageCreateInfo externalInfo = {0};
     externalInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
     externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_ANDROID_HARDWARE_BUFFER_BIT_ANDROID;
 
+    VkFormat viewFormats[] = {format, viewFormat};
+    VkImageFormatListCreateInfo formatList = {0};
+    if (format != viewFormat) {
+        formatList.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+        formatList.viewFormatCount = ARRAY_SIZE(viewFormats);
+        formatList.pViewFormats = viewFormats;
+        externalInfo.pNext = &formatList;
+    }
+
     VkImageCreateInfo imageInfo = {0};
     imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
     imageInfo.pNext = &externalInfo;
+    imageInfo.flags = format != viewFormat ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
     imageInfo.imageType = VK_IMAGE_TYPE_2D;
     imageInfo.format = format;
     imageInfo.extent.width = swapchain->imageExtent.width;
@@ -686,6 +738,58 @@ static VkResult createDri3AhbImage(VkDevice device, XWindowSwapchain* swapchain,
         *image = VK_NULL_HANDLE;
     }
     return result;
+}
+
+static void discardDri3HardwareBufferCandidate(VkDevice device,
+                                                XWindowSwapchain_Image* swapchainImage) {
+    if (swapchainImage->image) vulkanWrapper.vkDestroyImage(device, swapchainImage->image, NULL);
+    if (swapchainImage->memory) vulkanWrapper.vkFreeMemory(device, swapchainImage->memory, NULL);
+    if (swapchainImage->hardwareBuffer) AHardwareBuffer_release(swapchainImage->hardwareBuffer);
+    swapchainImage->image = VK_NULL_HANDLE;
+    swapchainImage->memory = VK_NULL_HANDLE;
+    swapchainImage->hardwareBuffer = NULL;
+}
+
+static VkResult tryCreateDirectDri3Image(VkDevice device, XWindowSwapchain* swapchain,
+                                         XWindowSwapchain_Image* swapchainImage) {
+    /* Probe Mesa's BGRA AHB zero-copy path. The exact-format check keeps the
+     * Vulkan image contract aligned with Termux:X11's BGRA sampling. */
+    VkFormat ahbVkFormat;
+    switch (swapchain->imageFormat) {
+        case VK_FORMAT_B8G8R8A8_UNORM:
+        case VK_FORMAT_B8G8R8A8_SRGB:
+            ahbVkFormat = VK_FORMAT_B8G8R8A8_UNORM;
+            break;
+        default:
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+
+    VkResult result = allocateDri3HardwareBuffer(
+        swapchain, swapchainImage, TERMUX_X11_AHARDWAREBUFFER_FORMAT_BGRA8888,
+        ahbVkFormat, VK_IMAGE_TILING_OPTIMAL, swapchain->imageUsage,
+        ahbVkFormat != swapchain->imageFormat ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
+    if (result != VK_SUCCESS) return result;
+
+    VkAndroidHardwareBufferPropertiesANDROID ahbProperties = {0};
+    VkAndroidHardwareBufferFormatPropertiesANDROID ahbFormatProperties = {0};
+    result = getDri3HardwareBufferProperties(device, swapchainImage->hardwareBuffer,
+                                              &ahbProperties, &ahbFormatProperties);
+    logDri3("direct BGRA AHardwareBuffer properties: VkResult=%d format=%d externalFormat=%llu memoryTypeBits=0x%x",
+            result, ahbFormatProperties.format,
+            (unsigned long long)ahbFormatProperties.externalFormat,
+            ahbProperties.memoryTypeBits);
+    if (result != VK_SUCCESS || ahbFormatProperties.format != ahbVkFormat) {
+        return result != VK_SUCCESS ? result : VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+
+    result = createDri3AhbImage(device, swapchain, swapchainImage->hardwareBuffer,
+                                ahbFormatProperties.format, swapchain->imageFormat,
+                                VK_IMAGE_TILING_OPTIMAL,
+                                swapchain->imageUsage, &swapchainImage->image,
+                                &swapchainImage->memory);
+    if (result != VK_SUCCESS) return result;
+
+    return createDri3Pixmap(swapchain, swapchainImage);
 }
 
 static bool waitForDri3HardwareBufferHandshake(int socketFd) {
@@ -835,49 +939,45 @@ static VkResult createReadbackBuffer(VkDevice device, XWindowSwapchain* swapchai
 
 static VkResult createCliImage(VkDevice device, XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage) {
     if (swapchain->useDri3) {
+        VkResult result;
+        if (swapchain->dri3ImagePath != DRI3_IMAGE_PATH_BLIT) {
+            result = tryCreateDirectDri3Image(device, swapchain, swapchainImage);
+            if (result == VK_SUCCESS) {
+                swapchain->dri3ImagePath = DRI3_IMAGE_PATH_DIRECT;
+                logDri3("using direct BGRA AHardwareBuffer presentation");
+                return VK_SUCCESS;
+            }
+            if (swapchain->dri3ImagePath == DRI3_IMAGE_PATH_DIRECT) return result;
+
+            swapchain->dri3ImagePath = DRI3_IMAGE_PATH_BLIT;
+            logDri3("direct BGRA AHardwareBuffer unavailable: VkResult=%d; using RGBA blit", result);
+            discardDri3HardwareBufferCandidate(device, swapchainImage);
+        }
+
         uint32_t ahbFormat;
         VkFormat ahbVkFormat;
         if (!getDri3HardwareBufferFormat(swapchain->imageFormat, &ahbFormat, &ahbVkFormat)) {
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
         }
 
-        VkResult result = allocateDri3HardwareBuffer(swapchain, swapchainImage, ahbFormat, ahbVkFormat);
+        result = allocateDri3HardwareBuffer(
+            swapchain, swapchainImage, ahbFormat, ahbVkFormat,
+            VK_IMAGE_TILING_LINEAR, VK_IMAGE_USAGE_TRANSFER_DST_BIT, 0);
         if (result != VK_SUCCESS) {
             logDri3("AHardwareBuffer allocation failed: VkResult=%d", result);
             return result;
         }
 
-        VkAndroidHardwareBufferPropertiesANDROID ahbProperties;
-        VkAndroidHardwareBufferFormatPropertiesANDROID ahbFormatProperties;
+        VkAndroidHardwareBufferPropertiesANDROID ahbProperties = {0};
+        VkAndroidHardwareBufferFormatPropertiesANDROID ahbFormatProperties = {0};
         result = getDri3HardwareBufferProperties(device, swapchainImage->hardwareBuffer,
                                                   &ahbProperties, &ahbFormatProperties);
-        logDri3("AHardwareBuffer properties: VkResult=%d format=%d externalFormat=%llu memoryTypeBits=0x%x",
+        logDri3("RGBA blit AHardwareBuffer properties: VkResult=%d format=%d externalFormat=%llu memoryTypeBits=0x%x",
                 result, ahbFormatProperties.format,
                 (unsigned long long)ahbFormatProperties.externalFormat,
                 ahbProperties.memoryTypeBits);
         if (result != VK_SUCCESS) return result;
-
-        if (ahbFormatProperties.format == swapchain->imageFormat) {
-            result = createDri3AhbImage(device, swapchain, swapchainImage->hardwareBuffer,
-                                        ahbFormatProperties.format, VK_IMAGE_TILING_OPTIMAL,
-                                        swapchain->imageUsage, &swapchainImage->image,
-                                        &swapchainImage->memory);
-            if (result == VK_SUCCESS) {
-                result = createDri3Pixmap(swapchain, swapchainImage);
-                if (result == VK_SUCCESS) logDri3("using direct AHardwareBuffer presentation");
-                return result;
-            }
-            logDri3("direct AHardwareBuffer image import failed: VkResult=%d; trying blit", result);
-        }
-
-        if (swapchainImage->image) {
-            vulkanWrapper.vkDestroyImage(device, swapchainImage->image, NULL);
-            swapchainImage->image = VK_NULL_HANDLE;
-        }
-        if (swapchainImage->memory) {
-            vulkanWrapper.vkFreeMemory(device, swapchainImage->memory, NULL);
-            swapchainImage->memory = VK_NULL_HANDLE;
-        }
+        if (ahbFormatProperties.format != ahbVkFormat) return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
         VkImageCreateInfo imageInfo = {0};
         imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -900,7 +1000,8 @@ static VkResult createCliImage(VkDevice device, XWindowSwapchain* swapchain, XWi
         if (result != VK_SUCCESS) return result;
 
         result = createDri3AhbImage(device, swapchain, swapchainImage->hardwareBuffer,
-                                    ahbFormatProperties.format, VK_IMAGE_TILING_LINEAR,
+                                    ahbFormatProperties.format, ahbFormatProperties.format,
+                                    VK_IMAGE_TILING_LINEAR,
                                     VK_IMAGE_USAGE_TRANSFER_DST_BIT, &swapchainImage->dri3PresentImage,
                                     &swapchainImage->dri3PresentMemory);
         if (result != VK_SUCCESS) {
@@ -939,6 +1040,24 @@ static VkResult createCliImage(VkDevice device, XWindowSwapchain* swapchain, XWi
 }
 
 static VkResult createCliCommandResources(VkDevice device, uint32_t graphicsQueueIndex, XWindowSwapchain* swapchain) {
+    bool needsCommandBuffers = false;
+    for (int i = 0; i < swapchain->imageCount; i++) {
+        if (!swapchain->useDri3 || swapchain->images[i].dri3Blit) {
+            needsCommandBuffers = true;
+            break;
+        }
+    }
+
+    for (int i = 0; i < swapchain->imageCount; i++) {
+        VkFenceCreateInfo fenceInfo = {0};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        VkResult result = vulkanWrapper.vkCreateFence(device, &fenceInfo, NULL,
+                                                      &swapchain->images[i].presentFence);
+        if (result != VK_SUCCESS) return result;
+    }
+
+    if (!needsCommandBuffers) return VK_SUCCESS;
+
     VkCommandPoolCreateInfo poolInfo = {0};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
     poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -948,6 +1067,8 @@ static VkResult createCliCommandResources(VkDevice device, uint32_t graphicsQueu
     if (result != VK_SUCCESS) return result;
 
     for (int i = 0; i < swapchain->imageCount; i++) {
+        if (swapchain->useDri3 && !swapchain->images[i].dri3Blit) continue;
+
         VkCommandBufferAllocateInfo allocateInfo = {0};
         allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocateInfo.commandPool = swapchain->commandPool;
@@ -955,11 +1076,6 @@ static VkResult createCliCommandResources(VkDevice device, uint32_t graphicsQueu
         allocateInfo.commandBufferCount = 1;
 
         result = vulkanWrapper.vkAllocateCommandBuffers(device, &allocateInfo, &swapchain->images[i].commandBuffer);
-        if (result != VK_SUCCESS) return result;
-
-        VkFenceCreateInfo fenceInfo = {0};
-        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-        result = vulkanWrapper.vkCreateFence(device, &fenceInfo, NULL, &swapchain->images[i].presentFence);
         if (result != VK_SUCCESS) return result;
     }
 
@@ -970,17 +1086,15 @@ static void destroyCliImage(VkDevice device, XWindowSwapchain* swapchain,
                             XWindowSwapchain_Image* swapchainImage) {
     xcb_connection_t* connection = (xcb_connection_t*)swapchain->xcbConnection;
     if (swapchainImage->xcbSyncFence && connection) {
-        xcb_void_cookie_t cookie = xcb_sync_destroy_fence_checked(connection, swapchainImage->xcbSyncFence);
-        xcb_flush(connection);
-        (void)xcbRequestSucceeded(connection, cookie);
+        xcb_void_cookie_t cookie = xcb_sync_destroy_fence(connection, swapchainImage->xcbSyncFence);
+        xcb_discard_reply(connection, cookie.sequence);
     }
     if (swapchainImage->xcbShmFence) {
         xshmfence_unmap_shm((struct xshmfence*)swapchainImage->xcbShmFence);
     }
     if (swapchainImage->xcbPixmap && connection) {
-        xcb_void_cookie_t cookie = xcb_free_pixmap_checked(connection, swapchainImage->xcbPixmap);
-        xcb_flush(connection);
-        (void)xcbRequestSucceeded(connection, cookie);
+        xcb_void_cookie_t cookie = xcb_free_pixmap(connection, swapchainImage->xcbPixmap);
+        xcb_discard_reply(connection, cookie.sequence);
     }
     if (swapchainImage->readbackData) vulkanWrapper.vkUnmapMemory(device, swapchainImage->readbackMemory);
     if (swapchainImage->readbackBuffer) vulkanWrapper.vkDestroyBuffer(device, swapchainImage->readbackBuffer, NULL);
@@ -999,6 +1113,7 @@ static void destroyCliImage(VkDevice device, XWindowSwapchain* swapchain,
     swapchainImage->dri3PresentMemory = VK_NULL_HANDLE;
     swapchainImage->dri3Blit = false;
     swapchainImage->dri3PresentImageInitialized = false;
+    swapchainImage->presentCommandBufferReusable = false;
     swapchainImage->readbackData = NULL;
     swapchainImage->readbackBuffer = VK_NULL_HANDLE;
     swapchainImage->readbackMemory = VK_NULL_HANDLE;
@@ -1026,7 +1141,8 @@ static void destroyCliCommandResources(VkDevice device, XWindowSwapchain* swapch
 
 int getSurfaceMinImageCount() {
 #ifdef VORTEK_CLI_X11
-    return 2;
+    /* Keep CPU rendering, GPU work, and X11 presentation pipelined. */
+    return 3;
 #else
     return 1;
 #endif
@@ -1058,14 +1174,22 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, VkPhysicalDevice phys
 
     swapchain->windowId = windowId;
     swapchain->jmethods = jmethods;
+#ifdef VORTEK_CLI_X11
+    swapchain->presentMode = swapchainInfo->presentMode;
+    swapchain->presentWakeFd = -1;
+#endif
     swapchain->imageCount = swapchainInfo->minImageCount;
     if (swapchain->imageCount <= 0) swapchain->imageCount = getSurfaceMinImageCount();
 #ifdef VORTEK_CLI_X11
     if (useX11Backend && swapchain->imageCount < getSurfaceMinImageCount()) {
         swapchain->imageCount = getSurfaceMinImageCount();
     }
-    if (useX11Backend && swapchain->imageCount > 3) {
-        swapchain->imageCount = 3;
+    if (useX11Backend && swapchain->presentMode == VK_PRESENT_MODE_MAILBOX_KHR &&
+        swapchain->imageCount < 4) {
+        swapchain->imageCount = 4;
+    }
+    if (useX11Backend && swapchain->imageCount > 4) {
+        swapchain->imageCount = 4;
     }
 #endif
     swapchain->images = calloc(swapchain->imageCount, sizeof(XWindowSwapchain_Image));
@@ -1084,9 +1208,6 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, VkPhysicalDevice phys
         (void)createXcbDri3State(swapchain);
         if (!swapchain->useDri3 && !createX11Image(swapchain)) goto error;
 
-        result = createCliCommandResources(device, graphicsQueueIndex, swapchain);
-        if (result != VK_SUCCESS) goto error;
-
         for (int i = 0; i < swapchain->imageCount; i++) {
             result = createCliImage(device, swapchain, &swapchain->images[i]);
             if (result != VK_SUCCESS) break;
@@ -1100,14 +1221,15 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, VkPhysicalDevice phys
             destroyXcbDri3State(swapchain);
 
             if (!createX11Image(swapchain)) goto error;
-            result = createCliCommandResources(device, graphicsQueueIndex, swapchain);
-            if (result != VK_SUCCESS) goto error;
             for (int i = 0; i < swapchain->imageCount; i++) {
                 result = createCliImage(device, swapchain, &swapchain->images[i]);
                 if (result != VK_SUCCESS) goto error;
             }
         }
         else if (result != VK_SUCCESS) goto error;
+
+        result = createCliCommandResources(device, graphicsQueueIndex, swapchain);
+        if (result != VK_SUCCESS) goto error;
     }
 #endif
 
@@ -1143,6 +1265,7 @@ void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain) {
                 destroyCliImage(device, swapchain, &swapchain->images[i]);
             }
         }
+        if (swapchain->xcbConnection) xcb_flush((xcb_connection_t*)swapchain->xcbConnection);
         destroyCliCommandResources(device, swapchain);
         destroyXcbDri3State(swapchain);
     }
@@ -1175,12 +1298,7 @@ VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t
     if (!imageIndex) return VK_ERROR_INITIALIZATION_FAILED;
 
     if (!XWindowSwapchain_hasWindowProvider(swapchain->jmethods)) {
-        processX11WindowEvents(swapchain);
-        if (swapchain->x11WindowLost ||
-            swapchain->imageExtent.width != swapchain->x11WindowExtent.width ||
-            swapchain->imageExtent.height != swapchain->x11WindowExtent.height) {
-            return VK_ERROR_SURFACE_LOST_KHR;
-        }
+        if (!swapchain->useDri3) processX11WindowEvents(swapchain);
 
         struct timespec deadline = {0};
         bool useDeadline = timeout != 0 && timeout != UINT64_MAX;
@@ -1203,6 +1321,12 @@ VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t
                 VkResult result = swapchain->presentStatus;
                 pthread_mutex_unlock(&swapchain->presentMutex);
                 return result;
+            }
+            if (swapchain->x11WindowLost ||
+                swapchain->imageExtent.width != swapchain->x11WindowExtent.width ||
+                swapchain->imageExtent.height != swapchain->x11WindowExtent.height) {
+                pthread_mutex_unlock(&swapchain->presentMutex);
+                return VK_ERROR_SURFACE_LOST_KHR;
             }
 
             for (int i = 0; i < swapchain->imageCount; i++) {
@@ -1251,12 +1375,7 @@ VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t
             }
 
             pthread_mutex_unlock(&swapchain->presentMutex);
-            processX11WindowEvents(swapchain);
-            if (swapchain->x11WindowLost ||
-                swapchain->imageExtent.width != swapchain->x11WindowExtent.width ||
-                swapchain->imageExtent.height != swapchain->x11WindowExtent.height) {
-                return VK_ERROR_SURFACE_LOST_KHR;
-            }
+            if (!swapchain->useDri3) processX11WindowEvents(swapchain);
             pthread_mutex_lock(&swapchain->presentMutex);
         }
     }
@@ -1491,12 +1610,12 @@ static VkResult presentDri3Pixmap(XWindowSwapchain* swapchain, uint32_t imageInd
     swapchainImage->presentSerial = serial;
     xshmfence_reset((struct xshmfence*)swapchainImage->xcbShmFence);
 
-    xcb_void_cookie_t cookie = xcb_present_pixmap_checked(
+    xcb_void_cookie_t presentCookie = xcb_present_pixmap(
         connection, (xcb_window_t)swapchain->x11Window, swapchainImage->xcbPixmap, serial,
         XCB_NONE, XCB_NONE, 0, 0, XCB_NONE, XCB_NONE, swapchainImage->xcbSyncFence,
-        XCB_PRESENT_OPTION_COPY, 0, 0, 0, 0, NULL);
-    xcb_flush(connection);
-    if (!xcbRequestSucceeded(connection, cookie)) {
+        swapchain->xcbPresentOptions, 0, 0, 0, 0, NULL);
+    xcb_discard_reply(connection, presentCookie.sequence);
+    if (xcb_flush(connection) <= 0) {
         swapchainImage->presentSerial = 0;
         return VK_ERROR_SURFACE_LOST_KHR;
     }
@@ -1509,27 +1628,52 @@ static void failDri3Presentation(XWindowSwapchain* swapchain) {
     for (int i = 0; i < swapchain->imageCount; i++) {
         if (swapchain->images[i].presentSerial != 0) releaseCliImageLocked(swapchain, (uint32_t)i);
     }
-    swapchain->presentPendingCount = 0;
     pthread_mutex_unlock(&swapchain->presentMutex);
 }
 
-static bool processDri3Events(XWindowSwapchain* swapchain, bool blockForIdle) {
+static void processDri3Events(XWindowSwapchain* swapchain) {
     xcb_connection_t* connection = (xcb_connection_t*)swapchain->xcbConnection;
-    if (!connection) return false;
+    if (!connection) return;
 
     while (true) {
-        xcb_generic_event_t* event = blockForIdle ? xcb_wait_for_event(connection) :
-                                                   xcb_poll_for_event(connection);
+        xcb_generic_event_t* event = xcb_poll_for_event(connection);
         if (!event) {
-            if (blockForIdle || xcb_connection_has_error(connection)) failDri3Presentation(swapchain);
-            return false;
+            if (xcb_connection_has_error(connection)) failDri3Presentation(swapchain);
+            return;
         }
 
         uint8_t responseType = event->response_type & 0x7f;
-        bool handledIdle = false;
         if (responseType == XCB_GE_GENERIC) {
             xcb_present_generic_event_t* genericEvent = (xcb_present_generic_event_t*)event;
             if (genericEvent->extension == swapchain->xcbPresentOpcode &&
+                genericEvent->evtype == XCB_PRESENT_CONFIGURE_NOTIFY) {
+                xcb_present_configure_notify_event_t* configureEvent =
+                    (xcb_present_configure_notify_event_t*)event;
+                if (configureEvent->event == swapchain->xcbPresentEvent) {
+                    pthread_mutex_lock(&swapchain->presentMutex);
+                    if (configureEvent->pixmap_flags & PRESENT_WINDOW_DESTROYED) {
+                        swapchain->x11WindowLost = true;
+                        swapchain->presentStatus = VK_ERROR_SURFACE_LOST_KHR;
+                    }
+                    else if (configureEvent->width > 0 && configureEvent->height > 0) {
+                        swapchain->x11WindowExtent.width = configureEvent->width;
+                        swapchain->x11WindowExtent.height = configureEvent->height;
+                    }
+                    pthread_cond_broadcast(&swapchain->imageAvailableCond);
+                    pthread_mutex_unlock(&swapchain->presentMutex);
+                }
+            }
+            else if (isDri3DebugEnabled() &&
+                genericEvent->extension == swapchain->xcbPresentOpcode &&
+                genericEvent->evtype == XCB_PRESENT_COMPLETE_NOTIFY) {
+                xcb_present_complete_notify_event_t* completeEvent =
+                    (xcb_present_complete_notify_event_t*)event;
+                if (completeEvent->event == swapchain->xcbPresentEvent) {
+                    logDri3("Present complete serial=%u mode=%u kind=%u",
+                            completeEvent->serial, completeEvent->mode, completeEvent->kind);
+                }
+            }
+            else if (genericEvent->extension == swapchain->xcbPresentOpcode &&
                 genericEvent->evtype == XCB_PRESENT_IDLE_NOTIFY) {
                 xcb_present_idle_notify_event_t* idleEvent = (xcb_present_idle_notify_event_t*)event;
                 if (idleEvent->event == swapchain->xcbPresentEvent) {
@@ -1542,9 +1686,7 @@ static bool processDri3Events(XWindowSwapchain* swapchain, bool blockForIdle) {
                                 xshmfence_await((struct xshmfence*)image->xcbShmFence) != 0) {
                                 swapchain->presentStatus = VK_ERROR_SURFACE_LOST_KHR;
                             }
-                            if (swapchain->presentPendingCount > 0) swapchain->presentPendingCount--;
                             releaseCliImageLocked(swapchain, (uint32_t)i);
-                            handledIdle = true;
                             break;
                         }
                     }
@@ -1555,13 +1697,60 @@ static bool processDri3Events(XWindowSwapchain* swapchain, bool blockForIdle) {
         else if (responseType == 0) {
             free(event);
             failDri3Presentation(swapchain);
-            return false;
+            return;
         }
 
         free(event);
-        if (blockForIdle && handledIdle) return true;
-        if (!blockForIdle) continue;
     }
+}
+
+static void wakeCliPresentThread(XWindowSwapchain* swapchain) {
+    if (swapchain->presentWakeFd >= 0) {
+        eventfd_t value = 1;
+        (void)eventfd_write(swapchain->presentWakeFd, value);
+    }
+    else {
+        pthread_cond_signal(&swapchain->presentCond);
+    }
+}
+
+static bool waitForDri3EventOrPresent(XWindowSwapchain* swapchain) {
+    xcb_connection_t* connection = (xcb_connection_t*)swapchain->xcbConnection;
+    if (!connection || swapchain->presentWakeFd < 0) return false;
+
+    struct pollfd pollFds[] = {
+        {.fd = xcb_get_file_descriptor(connection), .events = POLLIN},
+        {.fd = swapchain->presentWakeFd, .events = POLLIN}
+    };
+    int pollResult;
+    do {
+        pollResult = poll(pollFds, ARRAY_SIZE(pollFds), -1);
+    } while (pollResult < 0 && errno == EINTR);
+
+    if (pollResult <= 0 ||
+        (pollFds[0].revents & (POLLERR | POLLHUP | POLLNVAL)) ||
+        (pollFds[1].revents & (POLLERR | POLLHUP | POLLNVAL))) {
+        failDri3Presentation(swapchain);
+        return false;
+    }
+
+    if (pollFds[1].revents & POLLIN) {
+        eventfd_t value;
+        while (eventfd_read(swapchain->presentWakeFd, &value) == 0) {
+        }
+    }
+    if (pollFds[0].revents & POLLIN) {
+        processDri3Events(swapchain);
+    }
+    if (xcb_connection_has_error(connection)) {
+        failDri3Presentation(swapchain);
+        return false;
+    }
+
+    pthread_mutex_lock(&swapchain->presentMutex);
+    bool presentationHealthy = swapchain->presentStatus == VK_SUCCESS;
+    pthread_mutex_unlock(&swapchain->presentMutex);
+    return presentationHealthy;
 }
 
 static VkResult getCliPresentStatus(XWindowSwapchain* swapchain, uint32_t imageIndex) {
@@ -1585,11 +1774,12 @@ static VkResult enqueueCliPresentImage(XWindowSwapchain* swapchain, uint32_t ima
     else if (!swapchain->images[imageIndex].acquired || swapchain->images[imageIndex].presentQueued) result = VK_NOT_READY;
     else if (swapchain->presentQueueCount >= swapchain->imageCount) result = VK_NOT_READY;
     else {
+        bool queueWasEmpty = swapchain->presentQueueCount == 0;
         int queueIndex = (swapchain->presentQueueHead + swapchain->presentQueueCount) % swapchain->imageCount;
         swapchain->presentQueue[queueIndex] = imageIndex;
         swapchain->presentQueueCount++;
         swapchain->images[imageIndex].presentQueued = true;
-        pthread_cond_signal(&swapchain->presentCond);
+        if (queueWasEmpty) wakeCliPresentThread(swapchain);
     }
 
     pthread_mutex_unlock(&swapchain->presentMutex);
@@ -1630,21 +1820,17 @@ static void* cliPresentThreadMain(void* param) {
     while (true) {
         pthread_mutex_lock(&swapchain->presentMutex);
         while (swapchain->presentQueueCount == 0 && !swapchain->presentThreadStop) {
-            if (swapchain->useDri3 && swapchain->presentPendingCount > 0) {
+            if (swapchain->useDri3) {
                 pthread_mutex_unlock(&swapchain->presentMutex);
-                (void)processDri3Events(swapchain, true);
+                bool waitSucceeded = waitForDri3EventOrPresent(swapchain);
                 pthread_mutex_lock(&swapchain->presentMutex);
+                if (!waitSucceeded) swapchain->presentThreadStop = true;
                 continue;
             }
             pthread_cond_wait(&swapchain->presentCond, &swapchain->presentMutex);
         }
 
         if (swapchain->presentQueueCount == 0 && swapchain->presentThreadStop) {
-            if (swapchain->useDri3 && swapchain->presentPendingCount > 0) {
-                pthread_mutex_unlock(&swapchain->presentMutex);
-                (void)processDri3Events(swapchain, true);
-                continue;
-            }
             pthread_mutex_unlock(&swapchain->presentMutex);
             break;
         }
@@ -1660,15 +1846,12 @@ static void* cliPresentThreadMain(void* param) {
         if (result != VK_SUCCESS && swapchain->presentStatus == VK_SUCCESS) {
             swapchain->presentStatus = result;
         }
-        if (result == VK_SUCCESS && swapchain->useDri3) {
-            swapchain->presentPendingCount++;
-        }
-        else {
+        if (result != VK_SUCCESS || !swapchain->useDri3) {
             releaseCliImageLocked(swapchain, imageIndex);
         }
         pthread_mutex_unlock(&swapchain->presentMutex);
 
-        if (swapchain->useDri3) (void)processDri3Events(swapchain, false);
+        if (swapchain->useDri3) processDri3Events(swapchain);
     }
 
     return NULL;
@@ -1678,7 +1861,12 @@ static VkResult startCliPresentThread(XWindowSwapchain* swapchain) {
     swapchain->presentQueue = calloc(swapchain->imageCount, sizeof(uint32_t));
     if (!swapchain->presentQueue) return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-    if (pthread_mutex_init(&swapchain->presentMutex, NULL) != 0) goto error_free_queue;
+    if (swapchain->useDri3) {
+        swapchain->presentWakeFd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+        if (swapchain->presentWakeFd < 0) goto error_free_queue;
+    }
+
+    if (pthread_mutex_init(&swapchain->presentMutex, NULL) != 0) goto error_close_wake_fd;
     if (pthread_cond_init(&swapchain->presentCond, NULL) != 0) goto error_destroy_mutex;
     if (pthread_cond_init(&swapchain->imageAvailableCond, NULL) != 0) goto error_destroy_present_cond;
 
@@ -1696,6 +1884,9 @@ error_destroy_present_cond:
     pthread_cond_destroy(&swapchain->presentCond);
 error_destroy_mutex:
     pthread_mutex_destroy(&swapchain->presentMutex);
+error_close_wake_fd:
+    if (swapchain->presentWakeFd >= 0) close(swapchain->presentWakeFd);
+    swapchain->presentWakeFd = -1;
 error_free_queue:
     MEMFREE(swapchain->presentQueue);
     return VK_ERROR_INITIALIZATION_FAILED;
@@ -1706,7 +1897,7 @@ static void stopCliPresentThread(XWindowSwapchain* swapchain) {
 
     pthread_mutex_lock(&swapchain->presentMutex);
     swapchain->presentThreadStop = true;
-    pthread_cond_signal(&swapchain->presentCond);
+    wakeCliPresentThread(swapchain);
     pthread_mutex_unlock(&swapchain->presentMutex);
 
     if (swapchain->presentThreadRunning) {
@@ -1717,6 +1908,8 @@ static void stopCliPresentThread(XWindowSwapchain* swapchain) {
     pthread_cond_destroy(&swapchain->imageAvailableCond);
     pthread_cond_destroy(&swapchain->presentCond);
     pthread_mutex_destroy(&swapchain->presentMutex);
+    if (swapchain->presentWakeFd >= 0) close(swapchain->presentWakeFd);
+    swapchain->presentWakeFd = -1;
     MEMFREE(swapchain->presentQueue);
     swapchain->presentSyncInitialized = false;
 }
@@ -1728,134 +1921,139 @@ static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex
     }
 
     XWindowSwapchain_Image* swapchainImage = &swapchain->images[imageIndex];
-    if (!swapchainImage->commandBuffer || !swapchainImage->presentFence) return VK_ERROR_INITIALIZATION_FAILED;
 
     VkResult presentStatus = getCliPresentStatus(swapchain, imageIndex);
     if (presentStatus != VK_SUCCESS) return presentStatus;
 
     VkDevice device = swapchain->device;
     VkCommandBuffer commandBuffer = swapchainImage->commandBuffer;
-
-    VkResult result = vulkanWrapper.vkResetCommandBuffer(commandBuffer, 0);
-    if (result != VK_SUCCESS) return result;
-
-    VkCommandBufferBeginInfo beginInfo = {0};
-    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
-    result = vulkanWrapper.vkBeginCommandBuffer(commandBuffer, &beginInfo);
-    if (result != VK_SUCCESS) return result;
-
-    VkPipelineStageFlags presentStage;
-    if (swapchain->useDri3 && swapchainImage->dri3Blit) {
-        if (!swapchainImage->dri3PresentImage) return VK_ERROR_INITIALIZATION_FAILED;
-
-        VkImageMemoryBarrier barriers[2] = {0};
-        for (int i = 0; i < ARRAY_SIZE(barriers); i++) {
-            barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barriers[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            barriers[i].subresourceRange.baseMipLevel = 0;
-            barriers[i].subresourceRange.levelCount = 1;
-            barriers[i].subresourceRange.baseArrayLayer = 0;
-            barriers[i].subresourceRange.layerCount = 1;
-        }
-
-        barriers[0].srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-        barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        barriers[0].image = swapchainImage->image;
-
-        barriers[1].srcAccessMask = swapchainImage->dri3PresentImageInitialized ?
-                                    VK_ACCESS_MEMORY_READ_BIT : 0;
-        barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barriers[1].oldLayout = swapchainImage->dri3PresentImageInitialized ?
-                                VK_IMAGE_LAYOUT_PRESENT_SRC_KHR : VK_IMAGE_LAYOUT_UNDEFINED;
-        barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barriers[1].image = swapchainImage->dri3PresentImage;
-
-        vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                           VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                           0, 0, NULL, 0, NULL, ARRAY_SIZE(barriers), barriers);
-
-        VkImageCopy region = {0};
-        region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.srcSubresource.layerCount = 1;
-        region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.dstSubresource.layerCount = 1;
-        region.extent.width = swapchain->imageExtent.width;
-        region.extent.height = swapchain->imageExtent.height;
-        region.extent.depth = 1;
-        vulkanWrapper.vkCmdCopyImage(commandBuffer, swapchainImage->image,
-                                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                     swapchainImage->dri3PresentImage,
-                                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
-
-        barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-        barriers[0].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-        barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barriers[1].dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-        barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                           VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                           0, 0, NULL, 0, NULL, ARRAY_SIZE(barriers), barriers);
-        swapchainImage->dri3PresentImageInitialized = true;
-        presentStage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    bool submitCommandBuffer = !swapchain->useDri3 || swapchainImage->dri3Blit;
+    if (!swapchainImage->presentFence || (submitCommandBuffer && !commandBuffer)) {
+        return VK_ERROR_INITIALIZATION_FAILED;
     }
-    else {
-        VkImageMemoryBarrier barrier = {0};
-        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
-        barrier.dstAccessMask = swapchain->useDri3 ? VK_ACCESS_MEMORY_READ_BIT : VK_ACCESS_TRANSFER_READ_BIT;
-        barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        barrier.newLayout = swapchain->useDri3 ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR :
-                                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barrier.image = swapchainImage->image;
-        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        barrier.subresourceRange.baseMipLevel = 0;
-        barrier.subresourceRange.levelCount = 1;
-        barrier.subresourceRange.baseArrayLayer = 0;
-        barrier.subresourceRange.layerCount = 1;
+    bool recordCommandBuffer = submitCommandBuffer && !swapchainImage->presentCommandBufferReusable;
+    bool dri3PresentImageWasInitialized = swapchainImage->dri3PresentImageInitialized;
+    VkPipelineStageFlags presentStage = (swapchain->useDri3 && !swapchainImage->dri3Blit) ?
+                                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT :
+                                        VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkResult result;
 
-        presentStage = swapchain->useDri3 ? VK_PIPELINE_STAGE_ALL_COMMANDS_BIT :
-                                            VK_PIPELINE_STAGE_TRANSFER_BIT;
-        vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, presentStage,
-                                           0, 0, NULL, 0, NULL, 1, &barrier);
+    if (recordCommandBuffer) {
+        result = vulkanWrapper.vkResetCommandBuffer(commandBuffer, 0);
+        if (result != VK_SUCCESS) return result;
 
-        if (!swapchain->useDri3) {
-            VkBufferImageCopy region = {0};
-            region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-            region.imageSubresource.mipLevel = 0;
-            region.imageSubresource.baseArrayLayer = 0;
-            region.imageSubresource.layerCount = 1;
-            region.imageExtent.width = swapchain->imageExtent.width;
-            region.imageExtent.height = swapchain->imageExtent.height;
-            region.imageExtent.depth = 1;
+        VkCommandBufferBeginInfo beginInfo = {0};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
 
-            vulkanWrapper.vkCmdCopyImageToBuffer(commandBuffer, swapchainImage->image,
-                                                 VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                                                 swapchainImage->readbackBuffer, 1, &region);
+        result = vulkanWrapper.vkBeginCommandBuffer(commandBuffer, &beginInfo);
+        if (result != VK_SUCCESS) return result;
 
-            barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-            barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-            barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        if (swapchain->useDri3 && swapchainImage->dri3Blit) {
+            if (!swapchainImage->dri3PresentImage) return VK_ERROR_INITIALIZATION_FAILED;
 
+            VkImageMemoryBarrier barriers[2] = {0};
+            for (int i = 0; i < ARRAY_SIZE(barriers); i++) {
+                barriers[i].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+                barriers[i].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[i].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                barriers[i].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                barriers[i].subresourceRange.baseMipLevel = 0;
+                barriers[i].subresourceRange.levelCount = 1;
+                barriers[i].subresourceRange.baseArrayLayer = 0;
+                barriers[i].subresourceRange.layerCount = 1;
+            }
+
+            barriers[0].srcAccessMask = 0;
+            barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barriers[0].image = swapchainImage->image;
+
+            barriers[1].srcAccessMask = 0;
+            barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barriers[1].oldLayout = dri3PresentImageWasInitialized ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR :
+                                                                    VK_IMAGE_LAYOUT_UNDEFINED;
+            barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barriers[1].image = swapchainImage->dri3PresentImage;
+
+            vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                               VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                               0, 0, NULL, 0, NULL, ARRAY_SIZE(barriers), barriers);
+
+            VkImageCopy region = {0};
+            region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.srcSubresource.layerCount = 1;
+            region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            region.dstSubresource.layerCount = 1;
+            region.extent.width = swapchain->imageExtent.width;
+            region.extent.height = swapchain->imageExtent.height;
+            region.extent.depth = 1;
+            vulkanWrapper.vkCmdCopyImage(commandBuffer, swapchainImage->image,
+                                         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                         swapchainImage->dri3PresentImage,
+                                         VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+
+            barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            barriers[0].dstAccessMask = 0;
+            barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            barriers[1].dstAccessMask = 0;
+            barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
             vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                               0, 0, NULL, 0, NULL, 1, &barrier);
+                                               VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                               0, 0, NULL, 0, NULL, ARRAY_SIZE(barriers), barriers);
         }
-    }
+        else {
+            VkImageMemoryBarrier barrier = {0};
+            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+            barrier.dstAccessMask = swapchain->useDri3 ? VK_ACCESS_MEMORY_READ_BIT :
+                                                        VK_ACCESS_TRANSFER_READ_BIT;
+            barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+            barrier.newLayout = swapchain->useDri3 ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR :
+                                                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            barrier.image = swapchainImage->image;
+            barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            barrier.subresourceRange.baseMipLevel = 0;
+            barrier.subresourceRange.levelCount = 1;
+            barrier.subresourceRange.baseArrayLayer = 0;
+            barrier.subresourceRange.layerCount = 1;
 
-    result = vulkanWrapper.vkEndCommandBuffer(commandBuffer);
-    if (result != VK_SUCCESS) return result;
+            vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                               presentStage, 0, 0, NULL, 0, NULL, 1, &barrier);
+
+            if (!swapchain->useDri3) {
+                VkBufferImageCopy region = {0};
+                region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+                region.imageSubresource.mipLevel = 0;
+                region.imageSubresource.baseArrayLayer = 0;
+                region.imageSubresource.layerCount = 1;
+                region.imageExtent.width = swapchain->imageExtent.width;
+                region.imageExtent.height = swapchain->imageExtent.height;
+                region.imageExtent.depth = 1;
+
+                vulkanWrapper.vkCmdCopyImageToBuffer(commandBuffer, swapchainImage->image,
+                                                     VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                                     swapchainImage->readbackBuffer, 1, &region);
+
+                barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+                barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
+                vulkanWrapper.vkCmdPipelineBarrier(commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                                   0, 0, NULL, 0, NULL, 1, &barrier);
+            }
+        }
+
+        result = vulkanWrapper.vkEndCommandBuffer(commandBuffer);
+        if (result != VK_SUCCESS) return result;
+    }
 
     VkSubmitInfo submitInfo = {0};
     submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
@@ -1866,14 +2064,25 @@ static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex
     submitInfo.waitSemaphoreCount = waitSemaphoreCount;
     submitInfo.pWaitSemaphores = waitSemaphores;
     submitInfo.pWaitDstStageMask = waitSemaphoreCount > 0 ? waitStages : NULL;
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &commandBuffer;
+    submitInfo.commandBufferCount = submitCommandBuffer ? 1 : 0;
+    submitInfo.pCommandBuffers = submitCommandBuffer ? &commandBuffer : NULL;
 
     result = vulkanWrapper.vkResetFences(device, 1, &swapchainImage->presentFence);
     if (result != VK_SUCCESS) return result;
 
     result = vulkanWrapper.vkQueueSubmit(swapchain->queue, 1, &submitInfo, swapchainImage->presentFence);
     if (result != VK_SUCCESS) return result;
+
+    if (recordCommandBuffer) {
+        /* The imported AHB starts undefined. Record its steady-state layout once
+         * after the initial submission, then reuse that command buffer. */
+        if (swapchain->useDri3 && swapchainImage->dri3Blit && !dri3PresentImageWasInitialized) {
+            swapchainImage->dri3PresentImageInitialized = true;
+        }
+        else {
+            swapchainImage->presentCommandBufferReusable = true;
+        }
+    }
 
     result = enqueueCliPresentImage(swapchain, imageIndex);
     if (result != VK_SUCCESS) {

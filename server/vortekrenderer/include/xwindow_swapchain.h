@@ -14,6 +14,7 @@ typedef struct XWindowSwapchain_Image {
     VkDeviceMemory dri3PresentMemory;
     bool dri3Blit;
     bool dri3PresentImageInitialized;
+    bool presentCommandBufferReusable;
     bool acquired;
     bool presentQueued;
     VkCommandBuffer commandBuffer;
@@ -51,10 +52,12 @@ typedef struct XWindowSwapchain {
     bool presentThreadRunning;
     bool presentThreadStop;
     bool useDri3;
+    uint8_t dri3ImagePath;
+    VkPresentModeKHR presentMode;
+    int presentWakeFd;
     uint32_t* presentQueue;
     int presentQueueHead;
     int presentQueueCount;
-    uint32_t presentPendingCount;
     uint32_t presentSerial;
     VkResult presentStatus;
     void* x11Display;
@@ -67,6 +70,7 @@ typedef struct XWindowSwapchain {
     uint8_t x11Depth;
     uint8_t x11Bpp;
     uint8_t xcbPresentOpcode;
+    uint32_t xcbPresentOptions;
     void* xcbConnection;
     uint32_t xcbPresentEvent;
 #endif
