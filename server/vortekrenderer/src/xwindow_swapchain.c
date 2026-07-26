@@ -24,7 +24,8 @@
 
 enum {
     DRI3_IMAGE_PATH_UNSELECTED,
-    DRI3_IMAGE_PATH_DIRECT,
+    DRI3_IMAGE_PATH_DIRECT_BGRA,
+    DRI3_IMAGE_PATH_DIRECT_RGBA,
     DRI3_IMAGE_PATH_BLIT
 };
 
@@ -162,6 +163,11 @@ static bool isDri3DebugEnabled() {
     return value && value[0] && strcmp(value, "0") != 0;
 }
 
+static bool isFifoPresentMode(VkPresentModeKHR presentMode) {
+    return presentMode == VK_PRESENT_MODE_FIFO_KHR ||
+           presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+}
+
 static void logDri3(const char* format, ...) {
     if (!isDri3DebugEnabled()) return;
 
@@ -171,6 +177,23 @@ static void logDri3(const char* format, ...) {
     vfprintf(stderr, format, args);
     fputc('\n', stderr);
     va_end(args);
+}
+
+static bool preferRgbaDri3Image(VkPhysicalDevice physicalDevice) {
+    VkPhysicalDeviceDriverProperties driverProperties = {0};
+    driverProperties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES;
+
+    VkPhysicalDeviceProperties2 properties = {0};
+    properties.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+    properties.pNext = &driverProperties;
+    vulkanWrapper.vkGetPhysicalDeviceProperties2(physicalDevice, &properties);
+
+    bool preferRgba = driverProperties.driverID == VK_DRIVER_ID_ARM_PROPRIETARY ||
+                      properties.properties.vendorID == 0x13b5;
+    logDri3("GPU vendor=0x%x driver=%d; preferred direct AHardwareBuffer format=%s",
+            properties.properties.vendorID, driverProperties.driverID,
+            preferRgba ? "RGBA" : "BGRA");
+    return preferRgba;
 }
 
 static void destroyX11Image(Display* display, XImage* image, XShmSegmentInfo* shmInfo) {
@@ -413,8 +436,8 @@ static bool createXcbDri3State(XWindowSwapchain* swapchain) {
     }
 
     uint32_t presentEventMask = XCB_PRESENT_EVENT_MASK_CONFIGURE_NOTIFY |
+                                XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY |
                                 XCB_PRESENT_EVENT_MASK_IDLE_NOTIFY;
-    if (isDri3DebugEnabled()) presentEventMask |= XCB_PRESENT_EVENT_MASK_COMPLETE_NOTIFY;
 
     xcb_present_event_t presentEvent = xcb_generate_id(connection);
     xcb_void_cookie_t selectCookie = xcb_present_select_input_checked(
@@ -620,6 +643,17 @@ static bool getDri3HardwareBufferFormat(VkFormat imageFormat, uint32_t* ahbForma
     }
 }
 
+static VkFormat getDri3RgbaImageFormat(VkFormat imageFormat) {
+    switch (imageFormat) {
+        case VK_FORMAT_B8G8R8A8_UNORM:
+            return VK_FORMAT_R8G8B8A8_UNORM;
+        case VK_FORMAT_B8G8R8A8_SRGB:
+            return VK_FORMAT_R8G8B8A8_SRGB;
+        default:
+            return imageFormat;
+    }
+}
+
 static VkResult getDri3HardwareBufferUsage(XWindowSwapchain* swapchain, VkFormat format,
                                             VkImageTiling tiling, VkImageUsageFlags usage,
                                             VkImageCreateFlags flags, uint64_t* hardwareBufferUsage) {
@@ -750,31 +784,48 @@ static void discardDri3HardwareBufferCandidate(VkDevice device,
     swapchainImage->hardwareBuffer = NULL;
 }
 
-static VkResult tryCreateDirectDri3Image(VkDevice device, XWindowSwapchain* swapchain,
-                                         XWindowSwapchain_Image* swapchainImage) {
-    /* Probe Mesa's BGRA AHB zero-copy path. The exact-format check keeps the
-     * Vulkan image contract aligned with Termux:X11's BGRA sampling. */
+static VkResult createDirectDri3Image(VkDevice device, XWindowSwapchain* swapchain,
+                                      XWindowSwapchain_Image* swapchainImage,
+                                      uint8_t imagePath) {
+    uint32_t ahbFormat;
     VkFormat ahbVkFormat;
     switch (swapchain->imageFormat) {
         case VK_FORMAT_B8G8R8A8_UNORM:
         case VK_FORMAT_B8G8R8A8_SRGB:
-            ahbVkFormat = VK_FORMAT_B8G8R8A8_UNORM;
             break;
         default:
             return VK_ERROR_FORMAT_NOT_SUPPORTED;
     }
 
+    switch (imagePath) {
+        case DRI3_IMAGE_PATH_DIRECT_BGRA:
+            ahbFormat = TERMUX_X11_AHARDWAREBUFFER_FORMAT_BGRA8888;
+            ahbVkFormat = VK_FORMAT_B8G8R8A8_UNORM;
+            break;
+        case DRI3_IMAGE_PATH_DIRECT_RGBA:
+            /* Mali cannot render directly to a BGRA AHB. Use an RGBA AHB
+             * with a mutable BGRA view, matching mesa-wrapper's WSI path. */
+            ahbFormat = AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM;
+            ahbVkFormat = VK_FORMAT_R8G8B8A8_UNORM;
+            break;
+        default:
+            return VK_ERROR_FORMAT_NOT_SUPPORTED;
+    }
+
+    VkImageCreateFlags imageFlags = ahbVkFormat != swapchain->imageFormat ?
+                                    VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
     VkResult result = allocateDri3HardwareBuffer(
-        swapchain, swapchainImage, TERMUX_X11_AHARDWAREBUFFER_FORMAT_BGRA8888,
+        swapchain, swapchainImage, ahbFormat,
         ahbVkFormat, VK_IMAGE_TILING_OPTIMAL, swapchain->imageUsage,
-        ahbVkFormat != swapchain->imageFormat ? VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0);
+        imageFlags);
     if (result != VK_SUCCESS) return result;
 
     VkAndroidHardwareBufferPropertiesANDROID ahbProperties = {0};
     VkAndroidHardwareBufferFormatPropertiesANDROID ahbFormatProperties = {0};
     result = getDri3HardwareBufferProperties(device, swapchainImage->hardwareBuffer,
                                               &ahbProperties, &ahbFormatProperties);
-    logDri3("direct BGRA AHardwareBuffer properties: VkResult=%d format=%d externalFormat=%llu memoryTypeBits=0x%x",
+    logDri3("direct %s AHardwareBuffer properties: VkResult=%d format=%d externalFormat=%llu memoryTypeBits=0x%x",
+            imagePath == DRI3_IMAGE_PATH_DIRECT_BGRA ? "BGRA" : "RGBA mutable",
             result, ahbFormatProperties.format,
             (unsigned long long)ahbFormatProperties.externalFormat,
             ahbProperties.memoryTypeBits);
@@ -940,18 +991,46 @@ static VkResult createReadbackBuffer(VkDevice device, XWindowSwapchain* swapchai
 static VkResult createCliImage(VkDevice device, XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage) {
     if (swapchain->useDri3) {
         VkResult result;
-        if (swapchain->dri3ImagePath != DRI3_IMAGE_PATH_BLIT) {
-            result = tryCreateDirectDri3Image(device, swapchain, swapchainImage);
+        if (swapchain->dri3ImagePath == DRI3_IMAGE_PATH_UNSELECTED) {
+            uint8_t firstPath = swapchain->dri3PreferRgba ?
+                                DRI3_IMAGE_PATH_DIRECT_RGBA :
+                                DRI3_IMAGE_PATH_DIRECT_BGRA;
+            result = createDirectDri3Image(device, swapchain, swapchainImage,
+                                           firstPath);
             if (result == VK_SUCCESS) {
-                swapchain->dri3ImagePath = DRI3_IMAGE_PATH_DIRECT;
-                logDri3("using direct BGRA AHardwareBuffer presentation");
+                swapchain->dri3ImagePath = firstPath;
+                logDri3(firstPath == DRI3_IMAGE_PATH_DIRECT_RGBA ?
+                        "using direct RGBA AHardwareBuffer with mutable BGRA view" :
+                        "using direct BGRA AHardwareBuffer presentation");
                 return VK_SUCCESS;
             }
-            if (swapchain->dri3ImagePath == DRI3_IMAGE_PATH_DIRECT) return result;
-
-            swapchain->dri3ImagePath = DRI3_IMAGE_PATH_BLIT;
-            logDri3("direct BGRA AHardwareBuffer unavailable: VkResult=%d; using RGBA blit", result);
+            logDri3("direct %s AHardwareBuffer unavailable: VkResult=%d",
+                    firstPath == DRI3_IMAGE_PATH_DIRECT_RGBA ? "RGBA mutable" : "BGRA",
+                    result);
             discardDri3HardwareBufferCandidate(device, swapchainImage);
+
+            /* Mali may accept BGRA allocation/import but render it incorrectly,
+             * so never fall back from its RGBA path to direct BGRA. */
+            if (!swapchain->dri3PreferRgba) {
+                result = createDirectDri3Image(device, swapchain, swapchainImage,
+                                               DRI3_IMAGE_PATH_DIRECT_RGBA);
+                if (result == VK_SUCCESS) {
+                    swapchain->dri3ImagePath = DRI3_IMAGE_PATH_DIRECT_RGBA;
+                    logDri3("using direct RGBA AHardwareBuffer with mutable BGRA view");
+                    return VK_SUCCESS;
+                }
+                logDri3("direct RGBA mutable AHardwareBuffer unavailable: VkResult=%d",
+                        result);
+                discardDri3HardwareBufferCandidate(device, swapchainImage);
+            }
+
+            logDri3("using RGBA blit fallback");
+            swapchain->dri3ImagePath = DRI3_IMAGE_PATH_BLIT;
+        }
+        else if (swapchain->dri3ImagePath != DRI3_IMAGE_PATH_BLIT) {
+            result = createDirectDri3Image(device, swapchain, swapchainImage,
+                                           swapchain->dri3ImagePath);
+            return result;
         }
 
         uint32_t ahbFormat;
@@ -979,10 +1058,24 @@ static VkResult createCliImage(VkDevice device, XWindowSwapchain* swapchain, XWi
         if (result != VK_SUCCESS) return result;
         if (ahbFormatProperties.format != ahbVkFormat) return VK_ERROR_FORMAT_NOT_SUPPORTED;
 
+        VkFormat sourceFormat = swapchain->dri3PreferRgba ?
+                                getDri3RgbaImageFormat(swapchain->imageFormat) :
+                                swapchain->imageFormat;
+        VkFormat sourceViewFormats[] = {sourceFormat, swapchain->imageFormat};
+        VkImageFormatListCreateInfo sourceFormatList = {0};
+        if (sourceFormat != swapchain->imageFormat) {
+            sourceFormatList.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+            sourceFormatList.viewFormatCount = ARRAY_SIZE(sourceViewFormats);
+            sourceFormatList.pViewFormats = sourceViewFormats;
+        }
+
         VkImageCreateInfo imageInfo = {0};
         imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+        imageInfo.pNext = sourceFormatList.sType ? &sourceFormatList : NULL;
+        imageInfo.flags = sourceFormat != swapchain->imageFormat ?
+                          VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT : 0;
         imageInfo.imageType = VK_IMAGE_TYPE_2D;
-        imageInfo.format = swapchain->imageFormat;
+        imageInfo.format = sourceFormat;
         imageInfo.extent.width = swapchain->imageExtent.width;
         imageInfo.extent.height = swapchain->imageExtent.height;
         imageInfo.extent.depth = 1;
@@ -998,6 +1091,8 @@ static VkResult createCliImage(VkDevice device, XWindowSwapchain* swapchain, XWi
         if (result != VK_SUCCESS) return result;
         result = createDeviceLocalImageMemory(device, swapchainImage->image, &swapchainImage->memory);
         if (result != VK_SUCCESS) return result;
+        logDri3("blit source physical format=%d swapchain view format=%d",
+                sourceFormat, swapchain->imageFormat);
 
         result = createDri3AhbImage(device, swapchain, swapchainImage->hardwareBuffer,
                                     ahbFormatProperties.format, ahbFormatProperties.format,
@@ -1040,14 +1135,6 @@ static VkResult createCliImage(VkDevice device, XWindowSwapchain* swapchain, XWi
 }
 
 static VkResult createCliCommandResources(VkDevice device, uint32_t graphicsQueueIndex, XWindowSwapchain* swapchain) {
-    bool needsCommandBuffers = false;
-    for (int i = 0; i < swapchain->imageCount; i++) {
-        if (!swapchain->useDri3 || swapchain->images[i].dri3Blit) {
-            needsCommandBuffers = true;
-            break;
-        }
-    }
-
     for (int i = 0; i < swapchain->imageCount; i++) {
         VkFenceCreateInfo fenceInfo = {0};
         fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
@@ -1055,8 +1142,6 @@ static VkResult createCliCommandResources(VkDevice device, uint32_t graphicsQueu
                                                       &swapchain->images[i].presentFence);
         if (result != VK_SUCCESS) return result;
     }
-
-    if (!needsCommandBuffers) return VK_SUCCESS;
 
     VkCommandPoolCreateInfo poolInfo = {0};
     poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
@@ -1067,8 +1152,6 @@ static VkResult createCliCommandResources(VkDevice device, uint32_t graphicsQueu
     if (result != VK_SUCCESS) return result;
 
     for (int i = 0; i < swapchain->imageCount; i++) {
-        if (swapchain->useDri3 && !swapchain->images[i].dri3Blit) continue;
-
         VkCommandBufferAllocateInfo allocateInfo = {0};
         allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
         allocateInfo.commandPool = swapchain->commandPool;
@@ -1205,6 +1288,7 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, VkPhysicalDevice phys
     VkResult result = VK_SUCCESS;
 #ifdef VORTEK_CLI_X11
     if (useX11Backend) {
+        swapchain->dri3PreferRgba = preferRgbaDri3Image(physicalDevice);
         (void)createXcbDri3State(swapchain);
         if (!swapchain->useDri3 && !createX11Image(swapchain)) goto error;
 
@@ -1613,21 +1697,33 @@ static VkResult presentDri3Pixmap(XWindowSwapchain* swapchain, uint32_t imageInd
     swapchainImage->presentSerial = serial;
     xshmfence_reset((struct xshmfence*)swapchainImage->xcbShmFence);
 
+    bool fifoPresent = isFifoPresentMode(swapchain->presentMode);
+    uint64_t targetMsc = fifoPresent ? swapchain->nextPresentMsc : 0;
+
     xcb_void_cookie_t presentCookie = xcb_present_pixmap(
         connection, (xcb_window_t)swapchain->x11Window, swapchainImage->xcbPixmap, serial,
         XCB_NONE, XCB_NONE, 0, 0, XCB_NONE, XCB_NONE, swapchainImage->xcbSyncFence,
-        swapchain->xcbPresentOptions, 0, 0, 0, 0, NULL);
+        swapchain->xcbPresentOptions, targetMsc, 0, 0, 0, NULL);
     xcb_discard_reply(connection, presentCookie.sequence);
     if (xcb_flush(connection) <= 0) {
         swapchainImage->presentSerial = 0;
         return VK_ERROR_SURFACE_LOST_KHR;
     }
+    if (fifoPresent) {
+        pthread_mutex_lock(&swapchain->presentMutex);
+        swapchain->fifoPendingSerial = serial;
+        pthread_mutex_unlock(&swapchain->presentMutex);
+    }
+    logDri3("Present queued image=%u pixmap=%u serial=%u target_msc=%llu",
+            imageIndex, swapchainImage->xcbPixmap, serial,
+            (unsigned long long)targetMsc);
     return VK_SUCCESS;
 }
 
 static void failDri3Presentation(XWindowSwapchain* swapchain) {
     pthread_mutex_lock(&swapchain->presentMutex);
     if (swapchain->presentStatus == VK_SUCCESS) swapchain->presentStatus = VK_ERROR_SURFACE_LOST_KHR;
+    swapchain->fifoPendingSerial = 0;
     for (int i = 0; i < swapchain->imageCount; i++) {
         if (swapchain->images[i].presentSerial != 0) releaseCliImageLocked(swapchain, (uint32_t)i);
     }
@@ -1666,20 +1762,29 @@ static void processDri3Events(XWindowSwapchain* swapchain) {
                     pthread_mutex_unlock(&swapchain->presentMutex);
                 }
             }
-            else if (isDri3DebugEnabled() &&
-                genericEvent->extension == swapchain->xcbPresentOpcode &&
+            else if (genericEvent->extension == swapchain->xcbPresentOpcode &&
                 genericEvent->evtype == XCB_PRESENT_COMPLETE_NOTIFY) {
                 xcb_present_complete_notify_event_t* completeEvent =
                     (xcb_present_complete_notify_event_t*)event;
                 if (completeEvent->event == swapchain->xcbPresentEvent) {
-                    logDri3("Present complete serial=%u mode=%u kind=%u",
-                            completeEvent->serial, completeEvent->mode, completeEvent->kind);
+                    pthread_mutex_lock(&swapchain->presentMutex);
+                    if (completeEvent->kind == XCB_PRESENT_COMPLETE_KIND_PIXMAP &&
+                        swapchain->fifoPendingSerial == completeEvent->serial) {
+                        swapchain->fifoPendingSerial = 0;
+                        swapchain->nextPresentMsc = completeEvent->msc + 1;
+                    }
+                    pthread_mutex_unlock(&swapchain->presentMutex);
+                    logDri3("Present complete serial=%u msc=%llu mode=%u kind=%u",
+                            completeEvent->serial, (unsigned long long)completeEvent->msc,
+                            completeEvent->mode, completeEvent->kind);
                 }
             }
             else if (genericEvent->extension == swapchain->xcbPresentOpcode &&
                 genericEvent->evtype == XCB_PRESENT_IDLE_NOTIFY) {
                 xcb_present_idle_notify_event_t* idleEvent = (xcb_present_idle_notify_event_t*)event;
                 if (idleEvent->event == swapchain->xcbPresentEvent) {
+                    logDri3("Present idle pixmap=%u serial=%u",
+                            idleEvent->pixmap, idleEvent->serial);
                     pthread_mutex_lock(&swapchain->presentMutex);
                     for (int i = 0; i < swapchain->imageCount; i++) {
                         XWindowSwapchain_Image* image = &swapchain->images[i];
@@ -1756,6 +1861,20 @@ static bool waitForDri3EventOrPresent(XWindowSwapchain* swapchain) {
     return presentationHealthy;
 }
 
+static bool waitForDri3FifoComplete(XWindowSwapchain* swapchain) {
+    while (true) {
+        pthread_mutex_lock(&swapchain->presentMutex);
+        bool pending = swapchain->fifoPendingSerial != 0;
+        bool presentationHealthy = swapchain->presentStatus == VK_SUCCESS;
+        bool stopping = swapchain->presentThreadStop;
+        pthread_mutex_unlock(&swapchain->presentMutex);
+
+        if (stopping) return true;
+        if (!pending || !presentationHealthy) return presentationHealthy;
+        if (!waitForDri3EventOrPresent(swapchain)) return false;
+    }
+}
+
 static VkResult getCliPresentStatus(XWindowSwapchain* swapchain, uint32_t imageIndex) {
     VkResult status = VK_SUCCESS;
 
@@ -1800,7 +1919,11 @@ static VkResult waitCliPresentFence(XWindowSwapchain* swapchain, uint32_t imageI
 static VkResult finishCliPresentImage(XWindowSwapchain* swapchain, uint32_t imageIndex) {
     VkResult result = waitCliPresentFence(swapchain, imageIndex);
     if (result != VK_SUCCESS) return result;
-    if (swapchain->useDri3) return presentDri3Pixmap(swapchain, imageIndex);
+    if (swapchain->useDri3) {
+        result = presentDri3Pixmap(swapchain, imageIndex);
+        if (result != VK_SUCCESS || !isFifoPresentMode(swapchain->presentMode)) return result;
+        return waitForDri3FifoComplete(swapchain) ? VK_SUCCESS : VK_ERROR_SURFACE_LOST_KHR;
+    }
 
     XWindowSwapchain_Image* swapchainImage = &swapchain->images[imageIndex];
     VkDeviceSize bufferSize = (VkDeviceSize)swapchain->imageExtent.width * swapchain->imageExtent.height * 4;
@@ -1930,11 +2053,10 @@ static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex
 
     VkDevice device = swapchain->device;
     VkCommandBuffer commandBuffer = swapchainImage->commandBuffer;
-    bool submitCommandBuffer = !swapchain->useDri3 || swapchainImage->dri3Blit;
-    if (!swapchainImage->presentFence || (submitCommandBuffer && !commandBuffer)) {
+    if (!swapchainImage->presentFence || !commandBuffer) {
         return VK_ERROR_INITIALIZATION_FAILED;
     }
-    bool recordCommandBuffer = submitCommandBuffer && !swapchainImage->presentCommandBufferReusable;
+    bool recordCommandBuffer = !swapchainImage->presentCommandBufferReusable;
     bool dri3PresentImageWasInitialized = swapchainImage->dri3PresentImageInitialized;
     VkPipelineStageFlags presentStage = (swapchain->useDri3 && !swapchainImage->dri3Blit) ?
                                         VK_PIPELINE_STAGE_ALL_COMMANDS_BIT :
@@ -2067,8 +2189,8 @@ static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex
     submitInfo.waitSemaphoreCount = waitSemaphoreCount;
     submitInfo.pWaitSemaphores = waitSemaphores;
     submitInfo.pWaitDstStageMask = waitSemaphoreCount > 0 ? waitStages : NULL;
-    submitInfo.commandBufferCount = submitCommandBuffer ? 1 : 0;
-    submitInfo.pCommandBuffers = submitCommandBuffer ? &commandBuffer : NULL;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
 
     result = vulkanWrapper.vkResetFences(device, 1, &swapchainImage->presentFence);
     if (result != VK_SUCCESS) return result;

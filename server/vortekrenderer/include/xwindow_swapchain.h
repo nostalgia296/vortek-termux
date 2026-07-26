@@ -52,6 +52,7 @@ typedef struct XWindowSwapchain {
     bool presentThreadRunning;
     bool presentThreadStop;
     bool useDri3;
+    bool dri3PreferRgba;
     uint8_t dri3ImagePath;
     VkPresentModeKHR presentMode;
     int presentWakeFd;
@@ -59,6 +60,8 @@ typedef struct XWindowSwapchain {
     int presentQueueHead;
     int presentQueueCount;
     uint32_t presentSerial;
+    uint32_t fifoPendingSerial;
+    uint64_t nextPresentMsc;
     VkResult presentStatus;
     void* x11Display;
     void* x11Image;
