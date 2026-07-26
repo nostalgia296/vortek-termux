@@ -2163,7 +2163,7 @@ void vt_handle_vkCreateSwapchainKHR(VkContext* context) {
         swapchain = XWindowSwapchain_create(device, context->physicalDevice, context->graphicsQueueIndex, &createInfo, &context->jmethods, windowId);
         if (!swapchain) result = VK_ERROR_INITIALIZATION_FAILED;
     }
-    else result = VK_ERROR_SURFACE_LOST_KHR;
+    else result = VK_ERROR_OUT_OF_DATE_KHR;
 
     VT_SERIALIZE_CMD(VkSwapchainKHR, (VkSwapchainKHR)swapchain);
     vt_send(context->clientRing, result, outputBuffer, bufferSize);

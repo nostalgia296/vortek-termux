@@ -1322,11 +1322,14 @@ VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t
                 pthread_mutex_unlock(&swapchain->presentMutex);
                 return result;
             }
-            if (swapchain->x11WindowLost ||
-                swapchain->imageExtent.width != swapchain->x11WindowExtent.width ||
-                swapchain->imageExtent.height != swapchain->x11WindowExtent.height) {
+            if (swapchain->x11WindowLost) {
                 pthread_mutex_unlock(&swapchain->presentMutex);
                 return VK_ERROR_SURFACE_LOST_KHR;
+            }
+            if (swapchain->imageExtent.width != swapchain->x11WindowExtent.width ||
+                swapchain->imageExtent.height != swapchain->x11WindowExtent.height) {
+                pthread_mutex_unlock(&swapchain->presentMutex);
+                return VK_ERROR_OUT_OF_DATE_KHR;
             }
 
             for (int i = 0; i < swapchain->imageCount; i++) {
@@ -1400,7 +1403,7 @@ VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t
 
     VkResult result = VK_SUCCESS;
     if (swapchain->imageExtent.width != windowSize.width || swapchain->imageExtent.height != windowSize.height) {
-        result = VK_ERROR_SURFACE_LOST_KHR;
+        result = VK_ERROR_OUT_OF_DATE_KHR;
     }
 
     *imageIndex = 0;
