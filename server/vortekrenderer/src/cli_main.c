@@ -453,6 +453,14 @@ static bool initVulkan(CliConfig* config) {
     }
 
     if (!config->vkVersionProvided) {
+        const char* versionEnv = getenv("VORTEK_VK_VERSION");
+        if (!versionEnv || !versionEnv[0]) versionEnv = getenv("WRAPPER_VK_VERSION");
+        if (versionEnv && parseVkVersion(versionEnv,
+                                         &config->contextOptions.vkMaxVersion))
+            config->vkVersionProvided = true;
+    }
+
+    if (!config->vkVersionProvided) {
         uint32_t apiVersion = VK_API_VERSION_1_0;
         if (vulkanWrapper.vkEnumerateInstanceVersion) {
             VkResult result = vulkanWrapper.vkEnumerateInstanceVersion(&apiVersion);

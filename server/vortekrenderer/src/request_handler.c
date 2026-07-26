@@ -2,6 +2,7 @@
 #include "vk_context.h"
 #include "vulkan_helper.h"
 #include "sysvshared_memory.h"
+#include "wrapper_compat.h"
 
 #define MSG_DEBUG_UNIMPLEMENTED_FUNC "%s not implemented yet\n"
 
@@ -111,7 +112,7 @@ void vt_handle_vkGetPhysicalDeviceFeatures(VkContext* context) {
 
     VkPhysicalDeviceFeatures features = {0};
     vulkanWrapper.vkGetPhysicalDeviceFeatures(physicalDevice, &features);
-    checkDeviceFeatures(&features, NULL);
+    checkDeviceFeatures(context, &features, NULL);
 
     VT_SERIALIZE_CMD(VkPhysicalDeviceFeatures, &features);
     vt_send(context->clientRing, VK_SUCCESS, outputBuffer, bufferSize);
@@ -173,9 +174,23 @@ void vt_handle_vkCreateDevice(VkContext* context) {
                          globalImplementedDeviceExtensions, ARRAY_SIZE(globalImplementedDeviceExtensions));
     }
 
-    VkDevice device;
+    VortekWrapperCompat_prepareDeviceCreateInfo(context, &createInfo);
+
+    VkDevice device = VK_NULL_HANDLE;
     VkResult result = vulkanWrapper.vkCreateDevice(physicalDevice, &createInfo, NULL, &device);
-    if (result == VK_SUCCESS) initVulkanDevice(context, physicalDevice, device);
+    bool usedFallback = false;
+    if (result != VK_SUCCESS && VortekWrapperCompat_safeCreateEnabled(context) &&
+        createInfo.pNext) {
+        VkDeviceCreateInfo fallbackInfo = createInfo;
+        fallbackInfo.pNext = NULL;
+        result = vulkanWrapper.vkCreateDevice(physicalDevice, &fallbackInfo, NULL, &device);
+        usedFallback = result == VK_SUCCESS;
+    }
+    if (result == VK_SUCCESS) {
+        initVulkanDevice(context, physicalDevice, device);
+        VortekWrapperCompat_deviceCreated(context, device, !usedFallback);
+    }
+    VortekWrapperCompat_emitDeviceReport(context, &createInfo, result, usedFallback);
 
     VT_SERIALIZE_CMD(VkDevice, device);
     vt_send(context->clientRing, result, outputBuffer, bufferSize);
@@ -187,6 +202,7 @@ void vt_handle_vkDestroyDevice(VkContext* context) {
     vt_unserialize_vkDestroyDevice((VkDevice)&deviceId, NULL, context->inputBuffer, &context->memoryPool);
     VkDevice device = VkObject_fromId(deviceId);
 
+    VortekWrapperCompat_destroyDevice(context, device);
     vulkanWrapper.vkDestroyDevice(device, NULL);
 }
 
@@ -266,7 +282,10 @@ void vt_handle_vkQueueSubmit(VkContext* context) {
     if (context->textureDecoder) TextureDecoder_decodeAll(context->textureDecoder);
 
     VkResult result = vulkanWrapper.vkQueueSubmit(queue, submitCount, submits, fence);
-    if (result == VK_ERROR_DEVICE_LOST) context->status = result;
+    if (result == VK_ERROR_DEVICE_LOST) {
+        VortekWrapperCompat_logDeviceFault(context);
+        context->status = result;
+    }
 
     if (clientWaiting) vt_send(context->clientRing, result, NULL, 0);
 }
@@ -1017,7 +1036,8 @@ void vt_handle_vkCreatePipelineLayout(VkContext* context) {
     }
 
     VkPipelineLayout pipelineLayout;
-    VkResult result = vulkanWrapper.vkCreatePipelineLayout(device, &createInfo, NULL, &pipelineLayout);
+    VkResult result = VortekWrapperCompat_createPipelineLayout(
+        context, device, &createInfo, &pipelineLayout);
 
     VT_SERIALIZE_CMD(VkPipelineLayout, pipelineLayout);
     vt_send(context->clientRing, result, outputBuffer, bufferSize);
@@ -1031,7 +1051,7 @@ void vt_handle_vkDestroyPipelineLayout(VkContext* context) {
     VkDevice device = VkObject_fromId(deviceId);
     VkPipelineLayout pipelineLayout = VkObject_fromId(pipelineLayoutId);
 
-    vulkanWrapper.vkDestroyPipelineLayout(device, pipelineLayout, NULL);
+    VortekWrapperCompat_destroyPipelineLayout(context, device, pipelineLayout);
 }
 
 void vt_handle_vkCreateSampler(VkContext* context) {
@@ -1067,7 +1087,8 @@ void vt_handle_vkCreateDescriptorSetLayout(VkContext* context) {
     VkDevice device = VkObject_fromId(deviceId);
 
     VkDescriptorSetLayout setLayout;
-    VkResult result = vulkanWrapper.vkCreateDescriptorSetLayout(device, &createInfo, NULL, &setLayout);
+    VkResult result = VortekWrapperCompat_createDescriptorSetLayout(
+        context, device, &createInfo, &setLayout);
 
     VT_SERIALIZE_CMD(VkDescriptorSetLayout, setLayout);
     vt_send(context->clientRing, result, outputBuffer, bufferSize);
@@ -1081,7 +1102,8 @@ void vt_handle_vkDestroyDescriptorSetLayout(VkContext* context) {
     VkDevice device = VkObject_fromId(deviceId);
     VkDescriptorSetLayout descriptorSetLayout = VkObject_fromId(descriptorSetLayoutId);
 
-    vulkanWrapper.vkDestroyDescriptorSetLayout(device, descriptorSetLayout, NULL);
+    VortekWrapperCompat_destroyDescriptorSetLayout(context, device,
+                                                   descriptorSetLayout);
 }
 
 void vt_handle_vkCreateDescriptorPool(VkContext* context) {
@@ -1166,7 +1188,9 @@ void vt_handle_vkUpdateDescriptorSets(VkContext* context) {
     VkCopyDescriptorSet descriptorCopies[descriptorCopyCount];
     vt_unserialize_vkUpdateDescriptorSets(VK_NULL_HANDLE, NULL, descriptorWrites, NULL, descriptorCopies, context->inputBuffer, &context->memoryPool);
 
-    vulkanWrapper.vkUpdateDescriptorSets(device, descriptorWriteCount, descriptorWrites, descriptorCopyCount, descriptorCopies);
+    VortekWrapperCompat_updateDescriptorSets(
+        context, device, descriptorWriteCount, descriptorWrites,
+        descriptorCopyCount, descriptorCopies);
 }
 
 void vt_handle_vkCreateFramebuffer(VkContext* context) {
@@ -1256,6 +1280,7 @@ void vt_handle_vkDestroyCommandPool(VkContext* context) {
     VkDevice device = VkObject_fromId(deviceId);
     VkCommandPool commandPool = VkObject_fromId(commandPoolId);
 
+    VortekWrapperCompat_destroyCommandPool(context, device, commandPool);
     vulkanWrapper.vkDestroyCommandPool(device, commandPool, NULL);
 }
 
@@ -1268,6 +1293,7 @@ void vt_handle_vkResetCommandPool(VkContext* context) {
     VkDevice device = VkObject_fromId(deviceId);
     VkCommandPool commandPool = VkObject_fromId(commandPoolId);
 
+    VortekWrapperCompat_resetCommandPool(context, commandPool);
     vulkanWrapper.vkResetCommandPool(device, commandPool, flags);
 }
 
@@ -1280,6 +1306,9 @@ void vt_handle_vkAllocateCommandBuffers(VkContext* context) {
 
     VkCommandBuffer commandBuffers[allocateInfo.commandBufferCount];
     VkResult result = vulkanWrapper.vkAllocateCommandBuffers(device, &allocateInfo, commandBuffers);
+    if (result == VK_SUCCESS)
+        VortekWrapperCompat_trackCommandBuffers(context, device, &allocateInfo,
+                                                commandBuffers);
 
     VT_SERIALIZE_CMD(vkAllocateCommandBuffers, VK_NULL_HANDLE, &allocateInfo, commandBuffers);
     vt_send(context->clientRing, result, outputBuffer, bufferSize);
@@ -1297,6 +1326,8 @@ void vt_handle_vkFreeCommandBuffers(VkContext* context) {
     VkCommandBuffer commandBuffers[commandBufferCount];
     vt_unserialize_vkFreeCommandBuffers(VK_NULL_HANDLE, VK_NULL_HANDLE, NULL, commandBuffers, context->inputBuffer, &context->memoryPool);
 
+    VortekWrapperCompat_freeCommandBuffers(context, device, commandPool,
+                                           commandBufferCount, commandBuffers);
     vulkanWrapper.vkFreeCommandBuffers(device, commandPool, commandBufferCount, commandBuffers);
 }
 
@@ -1306,6 +1337,7 @@ void vt_handle_vkBeginCommandBuffer(VkContext* context) {
     vt_unserialize_vkBeginCommandBuffer((VkCommandBuffer)&commandBufferId, &beginInfo, context->inputBuffer, &context->memoryPool);
     VkCommandBuffer commandBuffer = VkObject_fromId(commandBufferId);
 
+    VortekWrapperCompat_resetCommandBuffer(context, commandBuffer);
     vulkanWrapper.vkBeginCommandBuffer(commandBuffer, &beginInfo);
 }
 
@@ -1343,6 +1375,7 @@ void vt_handle_vkResetCommandBuffer(VkContext* context) {
     vt_unserialize_vkResetCommandBuffer((VkCommandBuffer)&commandBufferId, &flags, context->inputBuffer, &context->memoryPool);
     VkCommandBuffer commandBuffer = VkObject_fromId(commandBufferId);
 
+    VortekWrapperCompat_resetCommandBuffer(context, commandBuffer);
     vulkanWrapper.vkResetCommandBuffer(commandBuffer, flags);
 }
 
@@ -1508,7 +1541,8 @@ void vt_handle_vkCmdBindVertexBuffers(VkContext* context) {
     VkDeviceSize offsets[bindingCount];
     vt_unserialize_vkCmdBindVertexBuffers(VK_NULL_HANDLE, NULL, NULL, buffers, offsets, context->inputBuffer, &context->memoryPool);
 
-    vulkanWrapper.vkCmdBindVertexBuffers(commandBuffer, firstBinding, bindingCount, buffers, offsets);
+    VortekWrapperCompat_cmdBindVertexBuffers(
+        context, commandBuffer, firstBinding, bindingCount, buffers, offsets);
 }
 
 void vt_handle_vkCmdDraw(VkContext* context) {
@@ -2251,7 +2285,7 @@ void vt_handle_vkGetPhysicalDeviceFeatures2(VkContext* context) {
     VkPhysicalDevice physicalDevice = VkObject_fromId(physicalDeviceId);
 
     vulkanWrapper.vkGetPhysicalDeviceFeatures2(physicalDevice, &features);
-    checkDeviceFeatures(&features.features, features.pNext);
+    checkDeviceFeatures(context, &features.features, features.pNext);
 
     VT_SERIALIZE_CMD(VkPhysicalDeviceFeatures2, &features);
     vt_send(context->clientRing, 0, outputBuffer, bufferSize);
@@ -2366,7 +2400,9 @@ void vt_handle_vkCmdPushDescriptorSetKHR(VkContext* context) {
     VkWriteDescriptorSet descriptorWrites[descriptorWriteCount];
     vt_unserialize_vkCmdPushDescriptorSetKHR(VK_NULL_HANDLE, NULL, VK_NULL_HANDLE, NULL, NULL, descriptorWrites, context->inputBuffer, &context->memoryPool);
 
-    vulkanWrapper.vkCmdPushDescriptorSet(commandBuffer, pipelineBindPoint, layout, set, descriptorWriteCount, descriptorWrites);
+    VortekWrapperCompat_cmdPushDescriptorSet(
+        context, commandBuffer, pipelineBindPoint, layout, set,
+        descriptorWriteCount, descriptorWrites);
 }
 
 void vt_handle_vkTrimCommandPool(VkContext* context) {
@@ -3125,7 +3161,9 @@ void vt_handle_vkCmdBindVertexBuffers2(VkContext* context) {
     VkDeviceSize strides[bindingCount];
     vt_unserialize_vkCmdBindVertexBuffers2(VK_NULL_HANDLE, NULL, NULL, buffers, offsets, sizes, strides, context->inputBuffer, &context->memoryPool);
 
-    vulkanWrapper.vkCmdBindVertexBuffers2(commandBuffer, firstBinding, bindingCount, buffers, offsets, sizes, strides);
+    VortekWrapperCompat_cmdBindVertexBuffers2(
+        context, commandBuffer, firstBinding, bindingCount, buffers, offsets,
+        sizes, strides);
 }
 
 void vt_handle_vkCmdSetDepthTestEnable(VkContext* context) {
@@ -3592,7 +3630,10 @@ void vt_handle_vkQueueSubmit2(VkContext* context) {
     vt_unserialize_vkQueueSubmit2(VK_NULL_HANDLE, NULL, submits, VK_NULL_HANDLE, context->inputBuffer, &context->memoryPool);
 
     VkResult result = vulkanWrapper.vkQueueSubmit2(queue, submitCount, submits, fence);
-    if (result == VK_ERROR_DEVICE_LOST) context->status = result;
+    if (result == VK_ERROR_DEVICE_LOST) {
+        VortekWrapperCompat_logDeviceFault(context);
+        context->status = result;
+    }
 
     if (clientWaiting) vt_send(context->clientRing, result, NULL, 0);
 }

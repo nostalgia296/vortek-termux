@@ -4,6 +4,23 @@
 #include "sysvshared_memory.h"
 #include "string_utils.h"
 #include "jni_utils.h"
+#include "wrapper_compat.h"
+
+static const char* getCompatEnv(const char* vortekName, const char* wrapperName) {
+    const char* value = getenv(vortekName);
+    if ((!value || !value[0]) && wrapperName) value = getenv(wrapperName);
+    return value && value[0] ? value : NULL;
+}
+
+static ResourceMemoryType getResourceMemoryTypeFromEnv(ResourceMemoryType fallback) {
+    const char* value = getCompatEnv("VORTEK_RESOURCE_TYPE", "WRAPPER_RESOURCE_TYPE");
+    if (!value) return fallback;
+    if (strstr(value, "opaque")) return RESOURCE_MEMORY_TYPE_OPAQUE_FD;
+    if (strstr(value, "dma")) return RESOURCE_MEMORY_TYPE_DMA_BUF;
+    if (strstr(value, "ahb") || strstr(value, "hardware"))
+        return RESOURCE_MEMORY_TYPE_AHARDWAREBUFFER;
+    return RESOURCE_MEMORY_TYPE_AUTO;
+}
 
 static bool loadJMethods(JMethods* jmethods) {
     if (!jmethods->jvm || !jmethods->obj) return false;
@@ -155,6 +172,18 @@ VkContext* createVkContextForClient(int clientFd, const VkContextOptions* option
     context->maxDeviceMemory = options ? options->maxDeviceMemory : 0;
     context->imageCacheSize = options ? options->imageCacheSize : 0;
     context->resourceMemoryType = options ? options->resourceMemoryType : RESOURCE_MEMORY_TYPE_AUTO;
+    if (context->maxDeviceMemory == 0) {
+        const char* maxMemory = getCompatEnv("VORTEK_VMEM_MAX_SIZE",
+                                             "WRAPPER_VMEM_MAX_SIZE");
+        if (maxMemory) {
+            long parsed = strtol(maxMemory, NULL, 10);
+            if (parsed > 0 && parsed <= INT16_MAX)
+                context->maxDeviceMemory = (short)parsed;
+        }
+    }
+    if (context->resourceMemoryType == RESOURCE_MEMORY_TYPE_AUTO)
+        context->resourceMemoryType = getResourceMemoryTypeFromEnv(
+            context->resourceMemoryType);
     if (options && options->exposedDeviceExtensions && options->exposedDeviceExtensionCount > 0) {
         context->exposedDeviceExtensions = ArrayList_fromStrings(options->exposedDeviceExtensions, options->exposedDeviceExtensionCount);
     }
@@ -247,16 +276,17 @@ void destroyVkContext(JNIEnv* env, VkContext* context) {
     }
 
     ArrayList_free(context->exposedDeviceExtensions, true);
-    context->exposedDeviceExtensions = NULL;
+    MEMFREE(context->exposedDeviceExtensions);
 
     ArrayList_free(context->disabledDeviceExtensions, true);
-    context->disabledDeviceExtensions = NULL;
+    MEMFREE(context->disabledDeviceExtensions);
 
     ArrayList_free(&context->extraDataRequests, true);
     pthread_mutex_destroy(&context->extraDataRequestsMutex);
 
     MEMFREE(context->memoryPool.data);
     MEMFREE(context->engineName);
+    VortekWrapperCompat_destroy(context);
     free(context);
 }
 

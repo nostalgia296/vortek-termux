@@ -20,6 +20,7 @@ set(VORTEK_RENDERER_SOURCES
     src/vk_object.c
     src/request_handler.c
     src/vulkan_helper.c
+    src/wrapper_compat.c
     src/vk_context.c
     src/resource_memory.c
     src/xwindow_swapchain.c

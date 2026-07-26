@@ -23,6 +23,9 @@ VkResult vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t* pSupportedVersion);
 PFN_vkVoidFunction vk_icdGetPhysicalDeviceProcAddr(VkInstance instance, const char* pName);
 
 static pthread_mutex_t vt_call_mutex = PTHREAD_MUTEX_INITIALIZER;
+static bool vt_wrapper_d3d = false;
+static bool vt_has_maintenance5 = false;
+static bool vt_has_dynamic_rendering_unused_attachments = false;
 
 #define VT_CALL_LOCK() pthread_mutex_lock(&vt_call_mutex)
 #define VT_CALL_UNLOCK() \
@@ -56,6 +59,13 @@ static VkResult waitForPipelineCreation(int pipelineCount, VkPipeline* pPipeline
 
 VkResult vt_call_vkCreateInstance(const VkInstanceCreateInfo* pCreateInfo, const VkAllocationCallbacks* pAllocator, VkInstance* pInstance) {
     VT_CALL_LOCK();
+
+    const char* engineName = pCreateInfo && pCreateInfo->pApplicationInfo ?
+        pCreateInfo->pApplicationInfo->pEngineName : NULL;
+    vt_wrapper_d3d = engineName &&
+        (strstr(engineName, "DXVK") || strstr(engineName, "vkd3d"));
+    vt_has_maintenance5 = false;
+    vt_has_dynamic_rendering_unused_attachments = false;
 
     VT_SERIALIZE_CMD(vkCreateInstance, pCreateInfo, NULL, NULL);
     VT_SEND_CHECKED(REQUEST_CODE_VK_CREATE_INSTANCE, VT_RETURN);
@@ -254,6 +264,17 @@ VkResult vt_call_vkEnumerateDeviceExtensionProperties(VkPhysicalDevice physicalD
     VT_RECV_CHECKED(VT_RETURN);
 
     vt_unserialize_vkEnumerateDeviceExtensionProperties(NULL, NULL, pPropertyCount, pProperties, inputBuffer, &globalMemoryPool);
+    if (pProperties) {
+        for (uint32_t i = 0; i < *pPropertyCount; i++) {
+            if (strcmp(pProperties[i].extensionName,
+                       VK_KHR_MAINTENANCE_5_EXTENSION_NAME) == 0)
+                vt_has_maintenance5 = true;
+            else if (strcmp(
+                         pProperties[i].extensionName,
+                         VK_EXT_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_EXTENSION_NAME) == 0)
+                vt_has_dynamic_rendering_unused_attachments = true;
+        }
+    }
     VT_CALL_UNLOCK();
     return (VkResult)result;
 }
@@ -1957,6 +1978,22 @@ void vt_call_vkGetPhysicalDeviceFeatures2(VkPhysicalDevice physicalDevice, VkPhy
     
     vt_unserialize_VkPhysicalDeviceFeatures2(pFeatures, inputBuffer, &globalMemoryPool);
     VT_CALL_UNLOCK();
+
+    /* These wrapper features are implemented without forwarding their feature
+     * structs to the host driver. Older Vortek protocol revisions intentionally
+     * skip unknown pNext structures, so restore the advertised values here. */
+    VkPhysicalDeviceMaintenance5FeaturesKHR* maintenance5 =
+        findNextVkStructure(pFeatures->pNext,
+                            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR);
+    if (maintenance5 && (vt_wrapper_d3d || vt_has_maintenance5))
+        maintenance5->maintenance5 = VK_TRUE;
+    VkPhysicalDeviceDynamicRenderingUnusedAttachmentsFeaturesEXT* unusedAttachments =
+        findNextVkStructure(
+            pFeatures->pNext,
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DYNAMIC_RENDERING_UNUSED_ATTACHMENTS_FEATURES_EXT);
+    if (unusedAttachments &&
+        (vt_wrapper_d3d || vt_has_dynamic_rendering_unused_attachments))
+        unusedAttachments->dynamicRenderingUnusedAttachments = VK_TRUE;
 }
 
 void vt_call_vkGetPhysicalDeviceProperties2(VkPhysicalDevice physicalDevice, VkPhysicalDeviceProperties2* pProperties) {
@@ -3189,6 +3226,47 @@ VkResult vt_call_vkUnmapMemory2KHR(VkDevice device, const VkMemoryUnmapInfoKHR* 
     return VK_SUCCESS;
 }
 
+/* VK_KHR_maintenance5 compatibility. The wrapper implementation translates
+ * the new entrypoints to operations already carried by the Vortek protocol. */
+void vt_call_vkCmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer,
+                                     VkBuffer buffer, VkDeviceSize offset,
+                                     VkDeviceSize size, VkIndexType indexType) {
+    (void)size;
+    vt_call_vkCmdBindIndexBuffer(commandBuffer, buffer, offset, indexType);
+}
+
+void vt_call_vkGetRenderingAreaGranularityKHR(
+    VkDevice device, const VkRenderingAreaInfoKHR* pRenderingAreaInfo,
+    VkExtent2D* pGranularity) {
+    (void)device;
+    (void)pRenderingAreaInfo;
+    if (pGranularity) *pGranularity = (VkExtent2D){1, 1};
+}
+
+void vt_call_vkGetImageSubresourceLayout2KHR(
+    VkDevice device, VkImage image, const VkImageSubresource2KHR* pSubresource,
+    VkSubresourceLayout2KHR* pLayout) {
+    if (!pSubresource || !pLayout) return;
+    vt_call_vkGetImageSubresourceLayout(device, image,
+                                        &pSubresource->imageSubresource,
+                                        &pLayout->subresourceLayout);
+}
+
+void vt_call_vkGetDeviceImageSubresourceLayoutKHR(
+    VkDevice device, const VkDeviceImageSubresourceInfoKHR* pInfo,
+    VkSubresourceLayout2KHR* pLayout) {
+    if (!pInfo || !pInfo->pCreateInfo || !pInfo->pSubresource || !pLayout)
+        return;
+    VkImage image = VK_NULL_HANDLE;
+    if (vt_call_vkCreateImage(device, pInfo->pCreateInfo, NULL, &image) !=
+        VK_SUCCESS)
+        return;
+    vt_call_vkGetImageSubresourceLayout(
+        device, image, &pInfo->pSubresource->imageSubresource,
+        &pLayout->subresourceLayout);
+    vt_call_vkDestroyImage(device, image, NULL);
+}
+
 static const struct VulkanFunc vkDispatchTable[] = {
     {"vkCreateInstance", vt_call_vkCreateInstance},
     {"vkDestroyInstance", vt_call_vkDestroyInstance},
@@ -3520,6 +3598,14 @@ static const struct VulkanFunc vkDispatchTable[] = {
     {"vkGetShaderModuleCreateInfoIdentifierEXT", vt_call_vkGetShaderModuleCreateInfoIdentifierEXT},
     {"vkMapMemory2KHR", vt_call_vkMapMemory2KHR},
     {"vkUnmapMemory2KHR", vt_call_vkUnmapMemory2KHR},
+    {"vkCmdBindIndexBuffer2", vt_call_vkCmdBindIndexBuffer2KHR},
+    {"vkCmdBindIndexBuffer2KHR", vt_call_vkCmdBindIndexBuffer2KHR},
+    {"vkGetRenderingAreaGranularity", vt_call_vkGetRenderingAreaGranularityKHR},
+    {"vkGetRenderingAreaGranularityKHR", vt_call_vkGetRenderingAreaGranularityKHR},
+    {"vkGetImageSubresourceLayout2", vt_call_vkGetImageSubresourceLayout2KHR},
+    {"vkGetImageSubresourceLayout2KHR", vt_call_vkGetImageSubresourceLayout2KHR},
+    {"vkGetDeviceImageSubresourceLayout", vt_call_vkGetDeviceImageSubresourceLayoutKHR},
+    {"vkGetDeviceImageSubresourceLayoutKHR", vt_call_vkGetDeviceImageSubresourceLayoutKHR},
     {"vk_icdNegotiateLoaderICDInterfaceVersion", vk_icdNegotiateLoaderICDInterfaceVersion},
     {"vk_icdGetPhysicalDeviceProcAddr", vk_icdGetPhysicalDeviceProcAddr},
 };

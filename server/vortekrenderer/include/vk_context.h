@@ -7,6 +7,8 @@
 #include "async_pipeline_creator.h"
 #include "timeline_semaphore.h"
 
+typedef struct VortekWrapperCompat VortekWrapperCompat;
+
 typedef struct VkContext {
     int clientFd;
     int vkMaxVersion;
@@ -45,6 +47,7 @@ typedef struct VkContext {
 
     JMethods jmethods;
     char* engineName;
+    VortekWrapperCompat* wrapperCompat;
 } VkContext;
 
 typedef struct ExtraDataRequest {

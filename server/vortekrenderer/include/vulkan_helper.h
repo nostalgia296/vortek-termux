@@ -33,7 +33,7 @@ extern VkExtensionProperties* getExposedDeviceExtensionProperties(VkContext* con
 extern void checkFormatProperties(VkPhysicalDevice physicalDevice, VkFormat format, VkFormatProperties* formatProperties);
 extern void checkImageFormatProperties(VkFormat format, VkImageType type, VkImageTiling tiling, VkImageUsageFlags usage, VkImageCreateFlags flags, VkImageFormatProperties* imageFormatProperties, VkResult* result);
 extern void checkDeviceProperties(VkContext* context, VkPhysicalDeviceProperties* properties, void* pNext);
-extern void checkDeviceFeatures(VkPhysicalDeviceFeatures* features, void* pNext);
+extern void checkDeviceFeatures(VkContext* context, VkPhysicalDeviceFeatures* features, void* pNext);
 extern void destroyVkObject(VkObjectType type, VkDevice device, void* handle);
 
 #endif

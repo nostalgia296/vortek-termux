@@ -2,10 +2,17 @@
 
 #include "vulkan_helper.h"
 #include "dma_utils.h"
+#include "wrapper_compat.h"
 
 #define VK_MAKE_VERSION_STR(s, v) sprintf(s, "%d.%d.%d", VK_VERSION_MAJOR(v), VK_VERSION_MINOR(v), VK_VERSION_PATCH(v))
 
 DeviceMemoryInfo deviceMemoryInfo = {0};
+
+static bool mapMemoryPlacedDisabled(void) {
+    const char* value = getenv("VORTEK_DISABLE_PLACED");
+    if (!value || !value[0]) value = getenv("WRAPPER_DISABLE_PLACED");
+    return value && atoi(value) != 0;
+}
 
 #if ENABLE_VALIDATION_LAYER
 static VkBool32 debugReportCallback(VkDebugReportFlagsEXT flags, VkDebugReportObjectTypeEXT type, uint64_t object, size_t location, int32_t messageCode, const char *pLayerPrefix, const char *pMessage, void *pUserData) {
@@ -29,20 +36,53 @@ static bool isExternalMemoryHandleTypeSupported(VkPhysicalDevice physicalDevice,
 }
 
 static void setupExposedDeviceExtensions(VkContext* context) {
-    if (!context->engineName) return;
-
     ArrayList_free(context->disabledDeviceExtensions, true);
-    context->disabledDeviceExtensions = NULL;
+    MEMFREE(context->disabledDeviceExtensions);
 
-    if (strcmp(context->engineName, "mesa zink") == 0) {
+    if (context->engineName && strcmp(context->engineName, "mesa zink") == 0) {
         const char* disabledDeviceExtensions[] = {"VK_EXT_extended_dynamic_state", "VK_EXT_color_write_enable", "VK_KHR_push_descriptor"};
         ArrayList_free(context->exposedDeviceExtensions, true);
         context->disabledDeviceExtensions = ArrayList_fromStrings(disabledDeviceExtensions, ARRAY_SIZE(disabledDeviceExtensions));
         context->exposedDeviceExtensions = ArrayList_fromStrings(globalExposedDeviceExtensions, ARRAY_SIZE(globalExposedDeviceExtensions));
     }
-    else if (strcmp(context->engineName, "DXVK") == 0) {
+    else if (context->engineName && strcmp(context->engineName, "DXVK") == 0) {
         const char* disabledDeviceExtensions[] = {"VK_KHR_shader_float_controls", "VK_EXT_hdr_metadata", "VK_EXT_swapchain_maintenance1"};
         context->disabledDeviceExtensions = ArrayList_fromStrings(disabledDeviceExtensions, ARRAY_SIZE(disabledDeviceExtensions));
+    }
+
+    uint32_t profileCount = 0;
+    const char* const* profileExtensions =
+        VortekWrapperCompat_getDisabledExtensions(context, &profileCount);
+    if (!context->disabledDeviceExtensions)
+        context->disabledDeviceExtensions = calloc(1, sizeof(ArrayList));
+    for (uint32_t i = 0; i < profileCount; i++) {
+        bool found = false;
+        for (int j = 0; j < context->disabledDeviceExtensions->size; j++) {
+            if (strcmp(context->disabledDeviceExtensions->elements[j],
+                       profileExtensions[i]) == 0) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) ArrayList_add(context->disabledDeviceExtensions,
+                                  strdup(profileExtensions[i]));
+    }
+
+    const char* blacklist = getenv("VORTEK_EXTENSION_BLACKLIST");
+    if (!blacklist || !blacklist[0]) blacklist = getenv("WRAPPER_EXTENSION_BLACKLIST");
+    if (blacklist && blacklist[0]) {
+        char* copy = strdup(blacklist);
+        char* save = NULL;
+        for (char* name = strtok_r(copy, ",", &save); name;
+             name = strtok_r(NULL, ",", &save)) {
+            while (*name == ' ' || *name == '\t') name++;
+            char* end = name + strlen(name);
+            while (end > name && (end[-1] == ' ' || end[-1] == '\t')) end--;
+            *end = '\0';
+            if (name[0]) ArrayList_add(context->disabledDeviceExtensions,
+                                       strdup(name));
+        }
+        free(copy);
     }
 }
 
@@ -77,7 +117,7 @@ void initVulkanInstance(VkContext* context, VkInstance instance, const VkApplica
 
     MEMFREE(context->engineName);
     context->engineName = applicationInfo && applicationInfo->pEngineName ? strdup(applicationInfo->pEngineName) : NULL;
-
+    VortekWrapperCompat_init(context, physicalDevices[0], applicationInfo);
     setupExposedDeviceExtensions(context);
 
 #if ENABLE_VALIDATION_LAYER
@@ -342,8 +382,34 @@ VkExtensionProperties* getExposedDeviceExtensionProperties(VkContext* context, V
         }
     }
 
+    uint32_t emulatedCount = 0;
+    const char* const* emulatedExtensions =
+        VortekWrapperCompat_getEmulatedExtensions(context, &emulatedCount);
+    const uint32_t extraCapacity = ARRAY_SIZE(globalImplementedDeviceExtensions) + emulatedCount;
+    const char* extraExtensions[extraCapacity];
+    uint32_t extraCount = 0;
+    for (uint32_t i = 0; i < ARRAY_SIZE(globalImplementedDeviceExtensions); i++) {
+        const char* name = globalImplementedDeviceExtensions[i];
+        if (mapMemoryPlacedDisabled() &&
+            (strcmp(name, VK_EXT_MAP_MEMORY_PLACED_EXTENSION_NAME) == 0 ||
+             strcmp(name, VK_KHR_MAP_MEMORY_2_EXTENSION_NAME) == 0))
+            continue;
+        extraExtensions[extraCount++] = name;
+    }
+    for (uint32_t i = 0; i < emulatedCount; i++) {
+        bool disabled = false;
+        for (int j = 0; context->disabledDeviceExtensions &&
+                        j < context->disabledDeviceExtensions->size; j++) {
+            if (strcmp(emulatedExtensions[i],
+                       context->disabledDeviceExtensions->elements[j]) == 0) {
+                disabled = true;
+                break;
+            }
+        }
+        if (!disabled) extraExtensions[extraCount++] = emulatedExtensions[i];
+    }
     injectExtensions2(context, &dstProperties, propertyCount,
-                      globalImplementedDeviceExtensions, ARRAY_SIZE(globalImplementedDeviceExtensions), NULL, 0);
+                      extraExtensions, extraCount, NULL, 0);
     return dstProperties;
 }
 
@@ -400,9 +466,11 @@ void checkDeviceProperties(VkContext* context, VkPhysicalDeviceProperties* prope
 
     VkPhysicalDeviceMapMemoryPlacedPropertiesEXT* mapPlacedProperties = findNextVkStructure(pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_PROPERTIES_EXT);
     if (mapPlacedProperties) mapPlacedProperties->minPlacedMemoryMapAlignment = getpagesize();
+
+    VortekWrapperCompat_applyProperties(context, properties, pNext);
 }
 
-void checkDeviceFeatures(VkPhysicalDeviceFeatures* features, void* pNext) {
+void checkDeviceFeatures(VkContext* context, VkPhysicalDeviceFeatures* features, void* pNext) {
     features->textureCompressionBC = VK_TRUE;
     features->depthClamp = VK_TRUE;
     features->depthBiasClamp = VK_TRUE;
@@ -427,10 +495,12 @@ void checkDeviceFeatures(VkPhysicalDeviceFeatures* features, void* pNext) {
 
     VkPhysicalDeviceMapMemoryPlacedFeaturesEXT* mapMemoryPlacedFeatures = findNextVkStructure(pNext, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAP_MEMORY_PLACED_FEATURES_EXT);
     if (mapMemoryPlacedFeatures) {
-        mapMemoryPlacedFeatures->memoryMapPlaced = VK_TRUE;
+        mapMemoryPlacedFeatures->memoryMapPlaced = mapMemoryPlacedDisabled() ? VK_FALSE : VK_TRUE;
         mapMemoryPlacedFeatures->memoryMapRangePlaced = VK_FALSE;
-        mapMemoryPlacedFeatures->memoryUnmapReserve = VK_TRUE;
+        mapMemoryPlacedFeatures->memoryUnmapReserve = mapMemoryPlacedDisabled() ? VK_FALSE : VK_TRUE;
     }
+
+    VortekWrapperCompat_applyFeatures(context, features, pNext);
 }
 
 void destroyVkObject(VkObjectType type, VkDevice device, void* handle) {
