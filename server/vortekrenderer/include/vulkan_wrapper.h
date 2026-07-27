@@ -168,6 +168,7 @@ typedef struct VulkanWrapper {
     PFN_vkTrimCommandPoolKHR vkTrimCommandPool;
     PFN_vkGetPhysicalDeviceExternalBufferProperties vkGetPhysicalDeviceExternalBufferProperties;
     PFN_vkGetMemoryFdKHR vkGetMemoryFd;
+    PFN_vkGetMemoryFdPropertiesKHR vkGetMemoryFdProperties;
     PFN_vkGetPhysicalDeviceExternalSemaphoreProperties vkGetPhysicalDeviceExternalSemaphoreProperties;
     PFN_vkGetSemaphoreFdKHR vkGetSemaphoreFd;
     PFN_vkGetPhysicalDeviceExternalFenceProperties vkGetPhysicalDeviceExternalFenceProperties;
@@ -470,6 +471,7 @@ static inline void loadVulkanDeviceFuncs(VulkanWrapper* vulkanWrapper, VkDevice 
     vulkanWrapper->vkCmdPushDescriptorSet = findVulkanDeviceFunc(vulkanWrapper, device, "vkCmdPushDescriptorSet");
     vulkanWrapper->vkTrimCommandPool = findVulkanDeviceFunc(vulkanWrapper, device, "vkTrimCommandPool");
     vulkanWrapper->vkGetMemoryFd = findVulkanDeviceFunc(vulkanWrapper, device, "vkGetMemoryFd");
+    vulkanWrapper->vkGetMemoryFdProperties = findVulkanDeviceFunc(vulkanWrapper, device, "vkGetMemoryFdPropertiesKHR");
     vulkanWrapper->vkGetSemaphoreFd = findVulkanDeviceFunc(vulkanWrapper, device, "vkGetSemaphoreFd");
     vulkanWrapper->vkGetFenceFd = findVulkanDeviceFunc(vulkanWrapper, device, "vkGetFenceFd");
     vulkanWrapper->vkGetDeviceGroupPeerMemoryFeatures = findVulkanDeviceFunc(vulkanWrapper, device, "vkGetDeviceGroupPeerMemoryFeatures");

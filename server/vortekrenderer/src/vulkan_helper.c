@@ -8,6 +8,15 @@
 
 DeviceMemoryInfo deviceMemoryInfo = {0};
 
+static const char* getResourceMemoryTypeName(ResourceMemoryType type) {
+    switch (type) {
+        case RESOURCE_MEMORY_TYPE_OPAQUE_FD: return "opaque-fd";
+        case RESOURCE_MEMORY_TYPE_DMA_BUF: return "dma-buf";
+        case RESOURCE_MEMORY_TYPE_AHARDWAREBUFFER: return "ahardwarebuffer";
+        default: return "auto";
+    }
+}
+
 static bool mapMemoryPlacedDisabled(void) {
     const char* value = getenv("VORTEK_DISABLE_PLACED");
     if (!value || !value[0]) value = getenv("WRAPPER_DISABLE_PLACED");
@@ -21,17 +30,21 @@ static VkBool32 debugReportCallback(VkDebugReportFlagsEXT flags, VkDebugReportOb
 }
 #endif
 
-static bool isExternalMemoryHandleTypeSupported(VkPhysicalDevice physicalDevice, VkExternalMemoryHandleTypeFlagBits handleType) {
+static bool isExternalMemoryHandleTypeSupported(VkPhysicalDevice physicalDevice,
+                                                VkExternalMemoryHandleTypeFlagBits handleType,
+                                                VkExternalMemoryFeatureFlags requiredFeatures) {
     VkPhysicalDeviceExternalBufferInfo bufferInfo = {0};
     bufferInfo.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_BUFFER_INFO;
     bufferInfo.handleType = handleType;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                       VK_BUFFER_USAGE_TRANSFER_DST_BIT;
 
     VkExternalBufferProperties bufferProperties = {0};
     bufferProperties.sType = VK_STRUCTURE_TYPE_EXTERNAL_BUFFER_PROPERTIES;
     vulkanWrapper.vkGetPhysicalDeviceExternalBufferProperties(physicalDevice, &bufferInfo, &bufferProperties);
     VkExternalMemoryProperties* memoryProperties = &bufferProperties.externalMemoryProperties;
 
-    return (memoryProperties->externalMemoryFeatures & (VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT | VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) != 0 &&
+    return (memoryProperties->externalMemoryFeatures & requiredFeatures) == requiredFeatures &&
            (memoryProperties->compatibleHandleTypes & handleType) != 0;
 }
 
@@ -112,8 +125,32 @@ void initVulkanInstance(VkContext* context, VkInstance instance, const VkApplica
         deviceMemoryInfo.maxAllocationSize = maxHeapSize * 2 / 3;
     }
 
-    context->hasExternalMemoryFd = isExternalMemoryHandleTypeSupported(physicalDevices[0], VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT);
-    context->hasExternalMemoryDMABuf = isExternalMemoryHandleTypeSupported(physicalDevices[0], VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT);
+    context->hasExternalMemoryFd = isExternalMemoryHandleTypeSupported(
+        physicalDevices[0], VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT,
+        VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT);
+    context->hasExternalMemoryDMABuf = isExternalMemoryHandleTypeSupported(
+        physicalDevices[0], VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+        VK_EXTERNAL_MEMORY_FEATURE_IMPORTABLE_BIT);
+
+    ResourceMemoryType effectiveMemoryType = context->resourceMemoryType;
+    if (effectiveMemoryType == RESOURCE_MEMORY_TYPE_AUTO)
+        effectiveMemoryType = context->hasExternalMemoryDMABuf ?
+            RESOURCE_MEMORY_TYPE_DMA_BUF :
+            RESOURCE_MEMORY_TYPE_AHARDWAREBUFFER;
+#ifdef VORTEK_CLI_X11
+    fprintf(stderr,
+            "vortek-cli: resource memory configured=%s effective=%s "
+            "opaque-fd-export=%d dma-buf-import=%d\n",
+            getResourceMemoryTypeName(context->resourceMemoryType),
+            getResourceMemoryTypeName(effectiveMemoryType),
+            context->hasExternalMemoryFd, context->hasExternalMemoryDMABuf);
+#else
+    println("vortek: resource memory configured=%s effective=%s "
+            "opaque-fd-export=%d dma-buf-import=%d",
+            getResourceMemoryTypeName(context->resourceMemoryType),
+            getResourceMemoryTypeName(effectiveMemoryType),
+            context->hasExternalMemoryFd, context->hasExternalMemoryDMABuf);
+#endif
 
     MEMFREE(context->engineName);
     context->engineName = applicationInfo && applicationInfo->pEngineName ? strdup(applicationInfo->pEngineName) : NULL;
@@ -172,7 +209,7 @@ uint32_t getMemoryPropertyFlags(uint32_t memoryTypeIndex) {
 bool isHostVisibleMemory(uint32_t memoryTypeIndex) {
     if (deviceMemoryInfo.memoryTypeCount == 0 || memoryTypeIndex >= deviceMemoryInfo.memoryTypeCount) return false;
     VkMemoryType* memoryType = &deviceMemoryInfo.memoryTypes[memoryTypeIndex];
-    return memoryType->propertyFlags & (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+    return memoryType->propertyFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
 }
 
 void injectExtensions(VkContext* context, char*** extensions, uint32_t* extensionCount, const char* const* extraExtensions, uint32_t extraExtensionCount, const char* const* skipExtensions, uint32_t skipExtensionCount) {

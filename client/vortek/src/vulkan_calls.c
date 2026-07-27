@@ -394,16 +394,37 @@ VkResult vt_call_vkMapMemory(VkDevice device, VkDeviceMemory memory, VkDeviceSiz
     int fd, result, numFds;
     recv_fds(serverFd, &fd, &numFds, &result, sizeof(VkResult));
     if (numFds == 1) {
-        if (size == VK_WHOLE_SIZE) size = mappedMemory->allocationSize;
-        mappedMemory->size = size;
-        
-        void* data = mmap(NULL, size, PROT_WRITE | PROT_READ, MAP_SHARED, fd, offset);
-        if (data != MAP_FAILED) {
-            CLOSEFD(fd);
-            mappedMemory->data = data;
-            *ppData = data;
+        if (offset > mappedMemory->allocationSize) {
+            result = VK_ERROR_MEMORY_MAP_FAILED;
         }
-        else result = VK_ERROR_MEMORY_MAP_FAILED;
+        else {
+            if (size == VK_WHOLE_SIZE)
+                size = mappedMemory->allocationSize - offset;
+            if (size == 0 || size > mappedMemory->allocationSize - offset) {
+                result = VK_ERROR_MEMORY_MAP_FAILED;
+            }
+            else {
+                VkDeviceSize pageSize = (VkDeviceSize)sysconf(_SC_PAGESIZE);
+                VkDeviceSize alignedOffset = offset & ~(pageSize - 1);
+                VkDeviceSize delta = offset - alignedOffset;
+                if (size > SIZE_MAX - delta) {
+                    result = VK_ERROR_MEMORY_MAP_FAILED;
+                }
+                else {
+                    mappedMemory->size = size + delta;
+                    void* mapBase = mmap(NULL, mappedMemory->size,
+                                         PROT_WRITE | PROT_READ, MAP_SHARED,
+                                         fd, alignedOffset);
+                    if (mapBase != MAP_FAILED) {
+                        mappedMemory->mapBase = mapBase;
+                        mappedMemory->data = (char*)mapBase + delta;
+                        *ppData = mappedMemory->data;
+                    }
+                    else result = VK_ERROR_MEMORY_MAP_FAILED;
+                }
+            }
+        }
+        CLOSEFD(fd);
     }
     else result = VK_ERROR_MEMORY_MAP_FAILED;
     
@@ -418,7 +439,8 @@ void vt_call_vkUnmapMemory(VkDevice device, VkDeviceMemory memory) {
     if (memoryObject->tag) {
         MappedMemory* mappedMemory = memoryObject->tag;
         if (mappedMemory->data) {
-            munmap(mappedMemory->data, mappedMemory->size);
+            munmap(mappedMemory->mapBase, mappedMemory->size);
+            mappedMemory->mapBase = NULL;
             mappedMemory->data = NULL;
         }
     }
@@ -3200,20 +3222,51 @@ VkResult vt_call_vkMapMemory2KHR(VkDevice device, const VkMemoryMapInfoKHR* pMem
     int fd, result, numFds;
     recv_fds(serverFd, &fd, &numFds, &result, sizeof(VkResult));
     if (numFds == 1) {
-        mappedMemory->size = pMemoryMapInfo->size;
-        if (mappedMemory->size == VK_WHOLE_SIZE) mappedMemory->size = mappedMemory->allocationSize;
-
-        VkMemoryMapPlacedInfoEXT* placedInfo = findNextVkStructure(pMemoryMapInfo->pNext, VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT);
-        void* placedAddr = placedInfo ? placedInfo->pPlacedAddress : NULL;
-
-        void* data = mmap(placedAddr, mappedMemory->size, PROT_WRITE | PROT_READ, MAP_SHARED | (placedAddr ? MAP_FIXED : 0), fd, pMemoryMapInfo->offset);
-        if (data != MAP_FAILED) {
-            CLOSEFD(fd);
-            mappedMemory->data = data;
-
-            if (!placedAddr) *ppData = data;
+        if (pMemoryMapInfo->offset > mappedMemory->allocationSize) {
+            result = VK_ERROR_MEMORY_MAP_FAILED;
         }
-        else result = VK_ERROR_MEMORY_MAP_FAILED;
+        else {
+            mappedMemory->size = pMemoryMapInfo->size;
+            if (mappedMemory->size == VK_WHOLE_SIZE)
+                mappedMemory->size = mappedMemory->allocationSize -
+                                     pMemoryMapInfo->offset;
+
+            if (mappedMemory->size == 0 ||
+                mappedMemory->size > mappedMemory->allocationSize -
+                                     pMemoryMapInfo->offset) {
+                result = VK_ERROR_MEMORY_MAP_FAILED;
+            }
+            else {
+                VkMemoryMapPlacedInfoEXT* placedInfo = findNextVkStructure(
+                    pMemoryMapInfo->pNext,
+                    VK_STRUCTURE_TYPE_MEMORY_MAP_PLACED_INFO_EXT);
+                void* placedAddr = placedInfo ? placedInfo->pPlacedAddress : NULL;
+
+                VkDeviceSize pageSize = (VkDeviceSize)sysconf(_SC_PAGESIZE);
+                VkDeviceSize alignedOffset = pMemoryMapInfo->offset &
+                                             ~(pageSize - 1);
+                VkDeviceSize delta = pMemoryMapInfo->offset - alignedOffset;
+                if ((placedAddr && delta != 0) ||
+                    mappedMemory->size > SIZE_MAX - delta) {
+                    result = VK_ERROR_MEMORY_MAP_FAILED;
+                }
+                else {
+                    mappedMemory->size += delta;
+                    void* mapBase = mmap(placedAddr, mappedMemory->size,
+                                         PROT_WRITE | PROT_READ,
+                                         MAP_SHARED |
+                                             (placedAddr ? MAP_FIXED : 0),
+                                         fd, alignedOffset);
+                    if (mapBase != MAP_FAILED) {
+                        mappedMemory->mapBase = mapBase;
+                        mappedMemory->data = (char*)mapBase + delta;
+                        *ppData = mappedMemory->data;
+                    }
+                    else result = VK_ERROR_MEMORY_MAP_FAILED;
+                }
+            }
+        }
+        CLOSEFD(fd);
     }
     else result = VK_ERROR_MEMORY_MAP_FAILED;
 

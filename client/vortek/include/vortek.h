@@ -121,8 +121,9 @@ typedef struct JMethods {
 
 typedef struct MappedMemory {
     void* data;
-    int allocationSize;
-    int size;
+    void* mapBase;
+    VkDeviceSize allocationSize;
+    VkDeviceSize size;
 } MappedMemory;
 
 typedef struct CommandBatch {

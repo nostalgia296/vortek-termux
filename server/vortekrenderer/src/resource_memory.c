@@ -2,8 +2,10 @@
 #include "sysvshared_memory.h"
 #include "vulkan_helper.h"
 #include "dma_utils.h"
+#include "native_handle.h"
 
-extern int AHardwareBuffer_getFd(AHardwareBuffer* hardwareBuffer);
+extern const native_handle_t* AHardwareBuffer_getNativeHandle(
+    const AHardwareBuffer* hardwareBuffer);
 extern DeviceMemoryInfo deviceMemoryInfo;
 
 static ResourceMemory* internalAllocate() {
@@ -14,18 +16,66 @@ static ResourceMemory* internalAllocate() {
     return resourceMemory;
 }
 
-static AHardwareBuffer* allocateHardwareBuffer(int size) {
+static AHardwareBuffer* allocateHardwareBuffer(VkDeviceSize size) {
+    if (size == 0 || size > UINT32_MAX) return NULL;
+
     AHardwareBuffer_Desc buffDesc = {0};
-    buffDesc.width = size;
+    buffDesc.width = (uint32_t)size;
     buffDesc.height = 1;
     buffDesc.layers = 1;
     buffDesc.usage = AHARDWAREBUFFER_USAGE_CPU_WRITE_OFTEN | AHARDWAREBUFFER_USAGE_CPU_READ_OFTEN;
     buffDesc.format = AHARDWAREBUFFER_FORMAT_BLOB;
 
     AHardwareBuffer* hardwareBuffer = NULL;
-    AHardwareBuffer_allocate(&buffDesc, &hardwareBuffer);
+    if (AHardwareBuffer_allocate(&buffDesc, &hardwareBuffer) != 0)
+        return NULL;
 
     return hardwareBuffer;
+}
+
+static uint32_t selectCompatibleHostMemoryType(uint32_t memoryTypeBits,
+                                               uint32_t preferredType) {
+    if (preferredType < deviceMemoryInfo.memoryTypeCount && preferredType < 32 &&
+        (memoryTypeBits & (1u << preferredType)) &&
+        isHostVisibleMemory(preferredType))
+        return preferredType;
+
+    VkMemoryPropertyFlags preferredFlags = getMemoryPropertyFlags(preferredType);
+    uint32_t fallback = UINT32_MAX;
+    for (uint32_t i = 0; i < deviceMemoryInfo.memoryTypeCount && i < 32; i++) {
+        if (!(memoryTypeBits & (1u << i)) || !isHostVisibleMemory(i)) continue;
+
+        VkMemoryPropertyFlags flags = getMemoryPropertyFlags(i);
+        if ((preferredFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
+            (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT))
+            return i;
+        if (fallback == UINT32_MAX) fallback = i;
+    }
+    return fallback;
+}
+
+static int getHardwareBufferMemoryFd(const AHardwareBuffer* hardwareBuffer,
+                                     VkDeviceSize allocationSize) {
+    const native_handle_t* handle =
+        AHardwareBuffer_getNativeHandle(hardwareBuffer);
+    if (!handle) return -1;
+
+    for (int i = 0; i < handle->numFds; i++) {
+        off_t size = lseek(handle->data[i], 0, SEEK_END);
+        if (size >= 0 && (VkDeviceSize)size >= allocationSize)
+            return handle->data[i];
+    }
+    return -1;
+}
+
+static ResourceMemoryType selectResourceMemoryType(const VkContext* context) {
+    if (context->resourceMemoryType != RESOURCE_MEMORY_TYPE_AUTO)
+        return context->resourceMemoryType;
+
+    /* OPAQUE_FD only guarantees Vulkan-to-Vulkan transport. In particular,
+     * Mali may export an FD that cannot be mapped with mmap(). */
+    return context->hasExternalMemoryDMABuf ? RESOURCE_MEMORY_TYPE_DMA_BUF :
+                                             RESOURCE_MEMORY_TYPE_AHARDWAREBUFFER;
 }
 
 ResourceMemory* ResourceMemory_allocate(VkContext* context, VkDevice device, VkMemoryAllocateInfo* memoryInfo) {
@@ -36,25 +86,9 @@ ResourceMemory* ResourceMemory_allocate(VkContext* context, VkDevice device, VkM
     VkResult result;
     ResourceMemory* resourceMemory = internalAllocate();
     if (isHostVisibleMemory(memoryInfo->memoryTypeIndex)) {
-        bool hasExternalMemoryFd = context->hasExternalMemoryFd;
-        bool hasExternalMemoryDMABuf = context->hasExternalMemoryDMABuf;
+        ResourceMemoryType memoryType = selectResourceMemoryType(context);
 
-        switch (context->resourceMemoryType) {
-            case RESOURCE_MEMORY_TYPE_OPAQUE_FD:
-                hasExternalMemoryFd = true;
-                hasExternalMemoryDMABuf = false;
-                break;
-            case RESOURCE_MEMORY_TYPE_DMA_BUF:
-                hasExternalMemoryFd = false;
-                hasExternalMemoryDMABuf = true;
-                break;
-            case RESOURCE_MEMORY_TYPE_AHARDWAREBUFFER:
-                hasExternalMemoryFd = false;
-                hasExternalMemoryDMABuf = false;
-                break;
-        }
-
-        if (hasExternalMemoryFd) {
+        if (memoryType == RESOURCE_MEMORY_TYPE_OPAQUE_FD) {
             VkExternalMemoryBufferCreateInfo externalMemoryBufferInfo = {0};
             externalMemoryBufferInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO;
             externalMemoryBufferInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
@@ -102,7 +136,7 @@ ResourceMemory* ResourceMemory_allocate(VkContext* context, VkDevice device, VkM
 
             int fd = -1;
             result = vulkanWrapper.vkGetMemoryFd(device, &getFdInfo, &fd);
-            if (result != VK_SUCCESS || fd <= 0) goto error;
+            if (result != VK_SUCCESS || fd < 0) goto error;
             resourceMemory->fd = fd;
         }
         else {
@@ -110,20 +144,37 @@ ResourceMemory* ResourceMemory_allocate(VkContext* context, VkDevice device, VkM
                 memoryInfo->memoryTypeIndex = getMemoryTypeIndex(0x7FFFFFFF, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
             }
 
-            bool useExternalMemoryAHB = !hasExternalMemoryDMABuf;
-            if (hasExternalMemoryDMABuf) {
+            bool useExternalMemoryAHB = memoryType != RESOURCE_MEMORY_TYPE_DMA_BUF;
+            if (memoryType == RESOURCE_MEMORY_TYPE_DMA_BUF) {
                 int fd = dmabuf_alloc(memoryInfo->allocationSize);
-                if (fd > 0) {
-                    int dupFd = dup(fd);
+                if (fd >= 0 && vulkanWrapper.vkGetMemoryFdProperties) {
+                    VkMemoryFdPropertiesKHR fdProperties = {0};
+                    fdProperties.sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR;
+                    result = vulkanWrapper.vkGetMemoryFdProperties(
+                        device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+                        fd, &fdProperties);
+
+                    uint32_t memoryTypeIndex = UINT32_MAX;
+                    if (result == VK_SUCCESS)
+                        memoryTypeIndex = selectCompatibleHostMemoryType(
+                            fdProperties.memoryTypeBits,
+                            memoryInfo->memoryTypeIndex);
+
+                    int dupFd = memoryTypeIndex != UINT32_MAX ? dup(fd) : -1;
                     VkImportMemoryFdInfoKHR memoryImportInfo = {0};
                     memoryImportInfo.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
                     memoryImportInfo.fd = dupFd;
                     memoryImportInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
 
-                    memoryInfo->pNext = &memoryImportInfo;
-                    result = vulkanWrapper.vkAllocateMemory(device, memoryInfo, NULL, &resourceMemory->memory);
+                    VkMemoryAllocateInfo importInfo = *memoryInfo;
+                    importInfo.pNext = &memoryImportInfo;
+                    importInfo.memoryTypeIndex = memoryTypeIndex;
+                    result = dupFd >= 0 ? vulkanWrapper.vkAllocateMemory(
+                        device, &importInfo, NULL, &resourceMemory->memory) :
+                        VK_ERROR_INVALID_EXTERNAL_HANDLE;
                     if (result == VK_SUCCESS) {
                         resourceMemory->fd = fd;
+                        memoryInfo->memoryTypeIndex = memoryTypeIndex;
                     }
                     else {
                         CLOSEFD(fd);
@@ -139,17 +190,32 @@ ResourceMemory* ResourceMemory_allocate(VkContext* context, VkDevice device, VkM
                 if (!hardwareBuffer) goto error;
                 resourceMemory->hardwareBuffer = hardwareBuffer;
 
-                int fd = AHardwareBuffer_getFd(hardwareBuffer);
-                if (fd <= 0) goto error;
+                VkAndroidHardwareBufferPropertiesANDROID ahbProperties = {0};
+                ahbProperties.sType =
+                    VK_STRUCTURE_TYPE_ANDROID_HARDWARE_BUFFER_PROPERTIES_ANDROID;
+                result = vulkanWrapper.vkGetAndroidHardwareBufferPropertiesANDROID(
+                    device, hardwareBuffer, &ahbProperties);
+                if (result != VK_SUCCESS) goto error;
+
+                uint32_t memoryTypeIndex = selectCompatibleHostMemoryType(
+                    ahbProperties.memoryTypeBits, memoryInfo->memoryTypeIndex);
+                if (memoryTypeIndex == UINT32_MAX) goto error;
+
+                int fd = getHardwareBufferMemoryFd(
+                    hardwareBuffer, ahbProperties.allocationSize);
+                if (fd < 0) goto error;
 
                 VkImportAndroidHardwareBufferInfoANDROID memoryImportInfo = {0};
                 memoryImportInfo.sType = VK_STRUCTURE_TYPE_IMPORT_ANDROID_HARDWARE_BUFFER_INFO_ANDROID;
                 memoryImportInfo.buffer = hardwareBuffer;
 
                 memoryInfo->pNext = &memoryImportInfo;
+                memoryInfo->allocationSize = ahbProperties.allocationSize;
+                memoryInfo->memoryTypeIndex = memoryTypeIndex;
                 result = vulkanWrapper.vkAllocateMemory(device, memoryInfo, NULL, &resourceMemory->memory);
                 if (result != VK_SUCCESS) goto error;
-                resourceMemory->fd = fd;
+                resourceMemory->fd = dup(fd);
+                if (resourceMemory->fd < 0) goto error;
             }
         }
     }

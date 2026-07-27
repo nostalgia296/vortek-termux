@@ -341,7 +341,11 @@ void vt_handle_vkMapMemory(VkContext* context) {
     ResourceMemory* resourceMemory = VkObject_fromId(memoryId);
 
     VkResult result = resourceMemory->fd != -1 ? VK_SUCCESS : VK_ERROR_MEMORY_MAP_FAILED;
-    send_fds(context->clientFd, &resourceMemory->fd, 1, &result, sizeof(VkResult));
+    if (result == VK_SUCCESS)
+        send_fds(context->clientFd, &resourceMemory->fd, 1, &result,
+                 sizeof(VkResult));
+    else
+        sock_write(context->clientFd, (char*)&result, sizeof(VkResult));
 }
 
 void vt_handle_vkUnmapMemory(VkContext* context) {
