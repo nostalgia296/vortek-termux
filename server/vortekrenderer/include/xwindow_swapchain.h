@@ -53,6 +53,7 @@ typedef struct XWindowSwapchain {
     bool presentThreadStop;
     bool useDri3;
     bool dri3PreferRgba;
+    bool dri3AllowDirect;
     uint8_t dri3ImagePath;
     VkPresentModeKHR presentMode;
     int presentWakeFd;

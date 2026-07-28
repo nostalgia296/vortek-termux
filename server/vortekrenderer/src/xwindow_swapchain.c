@@ -163,6 +163,15 @@ static bool isDri3DebugEnabled() {
     return value && value[0] && strcmp(value, "0") != 0;
 }
 
+static bool isDirectDri3Enabled(bool preferRgba) {
+    const char* value = getenv("VORTEK_CLI_X11_DRI3_DIRECT");
+    if (value && value[0]) return strcmp(value, "0") != 0;
+
+    /* Mali accepts an RGBA AHB imported with a mutable BGRA view, but some
+     * implementations corrupt attachment rendering through that direct path. */
+    return !preferRgba;
+}
+
 static bool isFifoPresentMode(VkPresentModeKHR presentMode) {
     return presentMode == VK_PRESENT_MODE_FIFO_KHR ||
            presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR;
@@ -991,7 +1000,12 @@ static VkResult createReadbackBuffer(VkDevice device, XWindowSwapchain* swapchai
 static VkResult createCliImage(VkDevice device, XWindowSwapchain* swapchain, XWindowSwapchain_Image* swapchainImage) {
     if (swapchain->useDri3) {
         VkResult result;
-        if (swapchain->dri3ImagePath == DRI3_IMAGE_PATH_UNSELECTED) {
+        if (swapchain->dri3ImagePath == DRI3_IMAGE_PATH_UNSELECTED &&
+            !swapchain->dri3AllowDirect) {
+            swapchain->dri3ImagePath = DRI3_IMAGE_PATH_BLIT;
+            logDri3("direct AHardwareBuffer rendering disabled; using RGBA blit fallback");
+        }
+        else if (swapchain->dri3ImagePath == DRI3_IMAGE_PATH_UNSELECTED) {
             uint8_t firstPath = swapchain->dri3PreferRgba ?
                                 DRI3_IMAGE_PATH_DIRECT_RGBA :
                                 DRI3_IMAGE_PATH_DIRECT_BGRA;
@@ -1289,6 +1303,11 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, VkPhysicalDevice phys
 #ifdef VORTEK_CLI_X11
     if (useX11Backend) {
         swapchain->dri3PreferRgba = preferRgbaDri3Image(physicalDevice);
+        swapchain->dri3AllowDirect = isDirectDri3Enabled(swapchain->dri3PreferRgba);
+        logDri3("direct AHardwareBuffer rendering=%s%s",
+                swapchain->dri3AllowDirect ? "enabled" : "disabled",
+                swapchain->dri3PreferRgba && swapchain->dri3AllowDirect ?
+                " (forced by VORTEK_CLI_X11_DRI3_DIRECT)" : "");
         (void)createXcbDri3State(swapchain);
         if (!swapchain->useDri3 && !createX11Image(swapchain)) goto error;
 
