@@ -90,6 +90,7 @@
 #include "socket_utils.h"
 #include "ring_buffer.h"
 #include "thread_pool.h"
+#include "wayland_wsi_protocol.h"
 
 typedef struct MemoryPool {
     void* data;
@@ -138,6 +139,7 @@ extern uint16_t maxClientRequestId;
 extern MemoryPool globalMemoryPool;
 extern RingBuffer* serverRing;
 extern RingBuffer* clientRing;
+extern uint8_t serverFeatures;
 #endif
 
 static inline void* findNextVkStructure(void* pNext, VkStructureType type) {

@@ -5,6 +5,7 @@ project(VortekRenderer)
 option(VORTEK_BUILD_JNI "Build the Android JNI shared library" ON)
 option(VORTEK_BUILD_CLI "Build the standalone Termux CLI service" OFF)
 option(VORTEK_CLI_X11 "Enable X11 presentation backend for the CLI service" ON)
+option(VORTEK_WAYLAND_SHM "Enable client-side Wayland wl_shm presentation" ON)
 
 set(WINLATOR_INCLUDE_DIR "../winlator/include" CACHE PATH "Path to Winlator public headers")
 set(WINLATOR_SOURCE_DIR "../winlator" CACHE PATH "Path to Winlator source tree")
@@ -40,6 +41,9 @@ if(VORTEK_BUILD_JNI)
                 ${VORTEK_RENDERER_SOURCES})
 
     target_include_directories(vortekrenderer PRIVATE ${VORTEK_INCLUDE_DIRS})
+    if(VORTEK_WAYLAND_SHM)
+        target_compile_definitions(vortekrenderer PRIVATE VORTEK_WAYLAND_SHM)
+    endif()
     target_link_libraries(vortekrenderer
                           ${ADRENOTOOLS_LIBRARY}
                           ${WINLATOR_LIBRARY}
@@ -53,6 +57,9 @@ if(VORTEK_BUILD_CLI)
                    ${VORTEK_RENDERER_SOURCES})
 
     target_include_directories(vortekrenderer-cli PRIVATE ${VORTEK_INCLUDE_DIRS})
+    if(VORTEK_WAYLAND_SHM)
+        target_compile_definitions(vortekrenderer-cli PRIVATE VORTEK_WAYLAND_SHM)
+    endif()
     if(VORTEK_CLI_ANDROID_API)
         if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64)")
             set(VORTEK_CLI_ANDROID_TRIPLE "aarch64-linux-android${VORTEK_CLI_ANDROID_API}")

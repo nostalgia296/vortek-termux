@@ -1,6 +1,13 @@
 #include "xwindow_swapchain.h"
 #include "vulkan_helper.h"
 
+#ifdef VORTEK_WAYLAND_SHM
+#include "sysvshared_memory.h"
+#include <errno.h>
+#include <limits.h>
+#include <sys/mman.h>
+#endif
+
 #ifdef VORTEK_CLI_X11
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
@@ -475,6 +482,15 @@ error:
 }
 #endif
 
+bool XWindowSwapchain_isWaylandSurface(uint64_t windowId) {
+#ifdef VORTEK_WAYLAND_SHM
+    return (windowId & VORTEK_WAYLAND_SURFACE_ID_BIT) != 0;
+#else
+    (void)windowId;
+    return false;
+#endif
+}
+
 bool XWindowSwapchain_hasWindowProvider(JMethods* jmethods) {
     return jmethods &&
            jmethods->env &&
@@ -612,6 +628,192 @@ static VkResult createImage(VkDevice device, XWindowSwapchain* swapchain, XWindo
     swapchainImage->memory = memory;
     return VK_SUCCESS;
 }
+
+#ifdef VORTEK_WAYLAND_SHM
+static VkResult createWaylandImageMemory(VkDevice device, VkImage image,
+                                         VkDeviceMemory* memory) {
+    VkMemoryRequirements requirements = {0};
+    vulkanWrapper.vkGetImageMemoryRequirements(device, image, &requirements);
+
+    VkMemoryAllocateInfo info = {0};
+    info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    info.allocationSize = requirements.size;
+    info.memoryTypeIndex = getMemoryTypeIndex(
+        requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    VkResult result = vulkanWrapper.vkAllocateMemory(device, &info, NULL, memory);
+    if (result != VK_SUCCESS) return result;
+    result = vulkanWrapper.vkBindImageMemory(device, image, *memory, 0);
+    if (result != VK_SUCCESS) {
+        vulkanWrapper.vkFreeMemory(device, *memory, NULL);
+        *memory = VK_NULL_HANDLE;
+    }
+    return result;
+}
+
+static VkResult createWaylandReadbackBuffer(
+    VkDevice device, XWindowSwapchain* swapchain,
+    XWindowSwapchain_Image* image) {
+    VkDeviceSize size = (VkDeviceSize)swapchain->waylandShmStride *
+                        swapchain->imageExtent.height;
+    VkBufferCreateInfo bufferInfo = {0};
+    bufferInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    bufferInfo.size = size;
+    bufferInfo.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    VkResult result = vulkanWrapper.vkCreateBuffer(
+        device, &bufferInfo, NULL, &image->readbackBuffer);
+    if (result != VK_SUCCESS) return result;
+
+    VkMemoryRequirements requirements = {0};
+    vulkanWrapper.vkGetBufferMemoryRequirements(
+        device, image->readbackBuffer, &requirements);
+    VkMemoryAllocateInfo memoryInfo = {0};
+    memoryInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+    memoryInfo.allocationSize = requirements.size;
+    memoryInfo.memoryTypeIndex = getMemoryTypeIndex(
+        requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT);
+    image->readbackMemoryFlags = getMemoryPropertyFlags(memoryInfo.memoryTypeIndex);
+    if (!(image->readbackMemoryFlags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT))
+        return VK_ERROR_MEMORY_MAP_FAILED;
+
+    result = vulkanWrapper.vkAllocateMemory(
+        device, &memoryInfo, NULL, &image->readbackMemory);
+    if (result != VK_SUCCESS) return result;
+    result = vulkanWrapper.vkBindBufferMemory(
+        device, image->readbackBuffer, image->readbackMemory, 0);
+    if (result != VK_SUCCESS) return result;
+    return vulkanWrapper.vkMapMemory(
+        device, image->readbackMemory, 0, size, 0, &image->readbackData);
+}
+
+static VkResult createWaylandImage(VkDevice device, XWindowSwapchain* swapchain,
+                                   XWindowSwapchain_Image* image) {
+    VkImageCreateInfo info = {0};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+    info.imageType = VK_IMAGE_TYPE_2D;
+    info.format = swapchain->imageFormat;
+    info.extent.width = swapchain->imageExtent.width;
+    info.extent.height = swapchain->imageExtent.height;
+    info.extent.depth = 1;
+    info.mipLevels = 1;
+    info.arrayLayers = 1;
+    info.samples = VK_SAMPLE_COUNT_1_BIT;
+    info.tiling = VK_IMAGE_TILING_OPTIMAL;
+    info.usage = swapchain->imageUsage | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+    info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    VkResult result = vulkanWrapper.vkCreateImage(
+        device, &info, NULL, &image->image);
+    if (result != VK_SUCCESS) return result;
+    result = createWaylandImageMemory(device, image->image, &image->memory);
+    if (result != VK_SUCCESS) return result;
+    return createWaylandReadbackBuffer(device, swapchain, image);
+}
+
+static VkResult createWaylandCommandResources(
+    VkDevice device, uint32_t graphicsQueueIndex, XWindowSwapchain* swapchain) {
+    VkCommandPoolCreateInfo poolInfo = {0};
+    poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+    poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    poolInfo.queueFamilyIndex = graphicsQueueIndex;
+    VkResult result = vulkanWrapper.vkCreateCommandPool(
+        device, &poolInfo, NULL, &swapchain->commandPool);
+    if (result != VK_SUCCESS) return result;
+
+    for (int i = 0; i < swapchain->imageCount; i++) {
+        VkFenceCreateInfo fenceInfo = {0};
+        fenceInfo.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        result = vulkanWrapper.vkCreateFence(
+            device, &fenceInfo, NULL, &swapchain->images[i].presentFence);
+        if (result != VK_SUCCESS) return result;
+
+        VkCommandBufferAllocateInfo allocateInfo = {0};
+        allocateInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+        allocateInfo.commandPool = swapchain->commandPool;
+        allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocateInfo.commandBufferCount = 1;
+        result = vulkanWrapper.vkAllocateCommandBuffers(
+            device, &allocateInfo, &swapchain->images[i].commandBuffer);
+        if (result != VK_SUCCESS) return result;
+    }
+    return VK_SUCCESS;
+}
+
+static VkResult createWaylandSharedMemory(XWindowSwapchain* swapchain) {
+    if (swapchain->imageExtent.width == 0 || swapchain->imageExtent.height == 0 ||
+        swapchain->imageExtent.width > UINT32_MAX / 4u)
+        return VK_ERROR_INITIALIZATION_FAILED;
+    swapchain->waylandShmStride = swapchain->imageExtent.width * 4u;
+    uint64_t imageBytes = (uint64_t)swapchain->waylandShmStride *
+                          swapchain->imageExtent.height;
+    long pageSizeValue = sysconf(_SC_PAGESIZE);
+    uint64_t pageSize = pageSizeValue > 0 ? (uint64_t)pageSizeValue : 4096;
+    if (imageBytes > UINT64_MAX - (pageSize - 1))
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    swapchain->waylandShmSliceSize =
+        (imageBytes + pageSize - 1) & ~(pageSize - 1);
+    if (swapchain->waylandShmSliceSize > UINT64_MAX /
+        (uint64_t)swapchain->imageCount)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    swapchain->waylandShmPoolSize = swapchain->waylandShmSliceSize *
+                                    (uint64_t)swapchain->imageCount;
+    if (swapchain->waylandShmPoolSize == 0 ||
+        swapchain->waylandShmPoolSize > INT32_MAX)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    swapchain->waylandShmFd = createMemoryFd(
+        "vortek-wayland", (int64_t)swapchain->waylandShmPoolSize);
+    if (swapchain->waylandShmFd < 0) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    swapchain->waylandShmData = mmap(
+        NULL, (size_t)swapchain->waylandShmPoolSize,
+        PROT_READ | PROT_WRITE, MAP_SHARED, swapchain->waylandShmFd, 0);
+    if (swapchain->waylandShmData == MAP_FAILED) {
+        swapchain->waylandShmData = NULL;
+        return VK_ERROR_MEMORY_MAP_FAILED;
+    }
+    return VK_SUCCESS;
+}
+
+static void destroyWaylandImage(VkDevice device, XWindowSwapchain_Image* image) {
+    if (image->readbackData)
+        vulkanWrapper.vkUnmapMemory(device, image->readbackMemory);
+    if (image->readbackBuffer)
+        vulkanWrapper.vkDestroyBuffer(device, image->readbackBuffer, NULL);
+    if (image->readbackMemory)
+        vulkanWrapper.vkFreeMemory(device, image->readbackMemory, NULL);
+    if (image->image) vulkanWrapper.vkDestroyImage(device, image->image, NULL);
+    if (image->memory) vulkanWrapper.vkFreeMemory(device, image->memory, NULL);
+    image->readbackData = NULL;
+    image->readbackBuffer = VK_NULL_HANDLE;
+    image->readbackMemory = VK_NULL_HANDLE;
+    image->image = VK_NULL_HANDLE;
+    image->memory = VK_NULL_HANDLE;
+}
+
+static void destroyWaylandResources(VkDevice device, XWindowSwapchain* swapchain) {
+    if (swapchain->images) {
+        for (int i = 0; i < swapchain->imageCount; i++) {
+            if (swapchain->images[i].presentFence)
+                vulkanWrapper.vkDestroyFence(
+                    device, swapchain->images[i].presentFence, NULL);
+            destroyWaylandImage(device, &swapchain->images[i]);
+        }
+    }
+    if (swapchain->commandPool)
+        vulkanWrapper.vkDestroyCommandPool(device, swapchain->commandPool, NULL);
+    if (swapchain->waylandShmData)
+        munmap(swapchain->waylandShmData,
+               (size_t)swapchain->waylandShmPoolSize);
+    if (swapchain->waylandShmFd >= 0) close(swapchain->waylandShmFd);
+    if (swapchain->presentSyncInitialized) {
+        pthread_cond_destroy(&swapchain->imageAvailableCond);
+        pthread_mutex_destroy(&swapchain->presentMutex);
+    }
+    swapchain->waylandShmData = NULL;
+    swapchain->waylandShmFd = -1;
+    swapchain->presentSyncInitialized = false;
+}
+#endif
 
 #ifdef VORTEK_CLI_X11
 static VkResult createDeviceLocalImageMemory(VkDevice device, VkImage image, VkDeviceMemory* pMemory) {
@@ -1260,13 +1462,59 @@ VkSurfaceFormatKHR* getSurfaceFormats(uint32_t* formatCount) {
     return surfaceFormats;
 }
 
+bool XWindowSwapchain_getWaylandInfo(XWindowSwapchain* swapchain,
+                                     VortekWaylandSwapchainInfo* info,
+                                     int* fd) {
+#ifdef VORTEK_WAYLAND_SHM
+    if (!swapchain || !swapchain->useWaylandShm || !info || !fd ||
+        swapchain->waylandShmFd < 0)
+        return false;
+    *info = (VortekWaylandSwapchainInfo) {
+        .version = VORTEK_WAYLAND_SWAPCHAIN_INFO_VERSION,
+        .imageCount = (uint32_t)swapchain->imageCount,
+        .width = swapchain->imageExtent.width,
+        .height = swapchain->imageExtent.height,
+        .stride = swapchain->waylandShmStride,
+        .shmFormat = VORTEK_WL_SHM_FORMAT_XRGB8888,
+        .sliceSize = swapchain->waylandShmSliceSize,
+        .poolSize = swapchain->waylandShmPoolSize,
+    };
+    *fd = swapchain->waylandShmFd;
+    return true;
+#else
+    (void)swapchain;
+    (void)info;
+    (void)fd;
+    return false;
+#endif
+}
+
+void XWindowSwapchain_releaseWaylandImage(XWindowSwapchain* swapchain,
+                                           uint32_t imageIndex) {
+#ifdef VORTEK_WAYLAND_SHM
+    if (!swapchain || !swapchain->useWaylandShm ||
+        imageIndex >= (uint32_t)swapchain->imageCount ||
+        !swapchain->presentSyncInitialized)
+        return;
+    pthread_mutex_lock(&swapchain->presentMutex);
+    swapchain->images[imageIndex].acquired = false;
+    swapchain->images[imageIndex].presentQueued = false;
+    pthread_cond_signal(&swapchain->imageAvailableCond);
+    pthread_mutex_unlock(&swapchain->presentMutex);
+#else
+    (void)swapchain;
+    (void)imageIndex;
+#endif
+}
+
 XWindowSwapchain* XWindowSwapchain_create(VkDevice device, VkPhysicalDevice physicalDevice, uint32_t graphicsQueueIndex, VkSwapchainCreateInfoKHR* swapchainInfo, JMethods* jmethods, uint64_t windowId) {
     XWindowSwapchain* swapchain = calloc(1, sizeof(XWindowSwapchain));
     if (!swapchain) return NULL;
 
+    bool useWaylandBackend = XWindowSwapchain_isWaylandSurface(windowId);
     bool useX11Backend = false;
 #ifdef VORTEK_CLI_X11
-    useX11Backend = !XWindowSwapchain_hasWindowProvider(jmethods);
+    useX11Backend = !useWaylandBackend && !XWindowSwapchain_hasWindowProvider(jmethods);
 #endif
 
     swapchain->windowId = windowId;
@@ -1275,8 +1523,17 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, VkPhysicalDevice phys
     swapchain->presentMode = swapchainInfo->presentMode;
     swapchain->presentWakeFd = -1;
 #endif
+#ifdef VORTEK_WAYLAND_SHM
+    swapchain->useWaylandShm = useWaylandBackend;
+    swapchain->waylandShmFd = -1;
+#endif
     swapchain->imageCount = swapchainInfo->minImageCount;
-    if (swapchain->imageCount <= 0) swapchain->imageCount = getSurfaceMinImageCount();
+    if (swapchain->imageCount <= 0)
+        swapchain->imageCount = useWaylandBackend ? 2 : getSurfaceMinImageCount();
+#ifdef VORTEK_WAYLAND_SHM
+    if (useWaylandBackend && swapchain->imageCount < 2) swapchain->imageCount = 2;
+    if (useWaylandBackend && swapchain->imageCount > 4) swapchain->imageCount = 4;
+#endif
 #ifdef VORTEK_CLI_X11
     if (useX11Backend && swapchain->imageCount < getSurfaceMinImageCount()) {
         swapchain->imageCount = getSurfaceMinImageCount();
@@ -1294,12 +1551,33 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, VkPhysicalDevice phys
     swapchain->imageFormat = swapchainInfo->imageFormat;
     swapchain->imageUsage = swapchainInfo->imageUsage;
     memcpy(&swapchain->imageExtent, &swapchainInfo->imageExtent, sizeof(VkExtent2D));
-#ifdef VORTEK_CLI_X11
+#if defined(VORTEK_CLI_X11) || defined(VORTEK_WAYLAND_SHM)
     swapchain->device = device;
     swapchain->physicalDevice = physicalDevice;
 #endif
 
     VkResult result = VK_SUCCESS;
+#ifdef VORTEK_WAYLAND_SHM
+    if (useWaylandBackend) {
+        result = createWaylandSharedMemory(swapchain);
+        if (result != VK_SUCCESS) goto error;
+        for (int i = 0; i < swapchain->imageCount; i++) {
+            result = createWaylandImage(device, swapchain, &swapchain->images[i]);
+            if (result != VK_SUCCESS) goto error;
+        }
+        result = createWaylandCommandResources(
+            device, graphicsQueueIndex, swapchain);
+        if (result != VK_SUCCESS) goto error;
+        if (pthread_mutex_init(&swapchain->presentMutex, NULL) != 0)
+            goto error;
+        if (pthread_cond_init(&swapchain->imageAvailableCond, NULL) != 0) {
+            pthread_mutex_destroy(&swapchain->presentMutex);
+            goto error;
+        }
+        swapchain->presentSyncInitialized = true;
+        swapchain->presentStatus = VK_SUCCESS;
+    }
+#endif
 #ifdef VORTEK_CLI_X11
     if (useX11Backend) {
         swapchain->dri3PreferRgba = preferRgbaDri3Image(physicalDevice);
@@ -1336,7 +1614,7 @@ XWindowSwapchain* XWindowSwapchain_create(VkDevice device, VkPhysicalDevice phys
     }
 #endif
 
-    if (!useX11Backend) {
+    if (!useX11Backend && !useWaylandBackend) {
         for (int i = 0; i < swapchain->imageCount; i++) {
             result = createImage(device, swapchain, &swapchain->images[i]);
             if (result != VK_SUCCESS) goto error;
@@ -1359,7 +1637,14 @@ error:
 
 void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain) {
     if (!swapchain) return;
+#ifdef VORTEK_WAYLAND_SHM
+    if (swapchain->useWaylandShm) {
+        destroyWaylandResources(device, swapchain);
+    }
+    else
+#endif
 #ifdef VORTEK_CLI_X11
+    {
     bool useX11Backend = !XWindowSwapchain_hasWindowProvider(swapchain->jmethods);
     if (useX11Backend) {
         stopCliPresentThread(swapchain);
@@ -1382,6 +1667,9 @@ void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain) {
             }
         }
     }
+#ifdef VORTEK_CLI_X11
+    }
+#endif
 
 #ifdef VORTEK_CLI_X11
     if (swapchain->x11GC) XFreeGC((Display*)swapchain->x11Display, (GC)swapchain->x11GC);
@@ -1396,10 +1684,53 @@ void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain) {
 }
 
 VkResult XWindowSwapchain_acquireNextImage(XWindowSwapchain* swapchain, uint64_t timeout, VkSemaphore signalSemaphore, VkFence fence, uint32_t* imageIndex) {
-#ifdef VORTEK_CLI_X11
     if (!swapchain) return VK_ERROR_SURFACE_LOST_KHR;
     if (!imageIndex) return VK_ERROR_INITIALIZATION_FAILED;
+#ifdef VORTEK_WAYLAND_SHM
+    if (swapchain->useWaylandShm) {
+        pthread_mutex_lock(&swapchain->presentMutex);
+        if (swapchain->presentStatus != VK_SUCCESS) {
+            VkResult status = swapchain->presentStatus;
+            pthread_mutex_unlock(&swapchain->presentMutex);
+            return status;
+        }
+        uint32_t selected = UINT32_MAX;
+        for (int i = 0; i < swapchain->imageCount; i++) {
+            uint32_t candidate = (swapchain->nextImageIndex + (uint32_t)i) %
+                                 (uint32_t)swapchain->imageCount;
+            if (!swapchain->images[candidate].acquired) {
+                selected = candidate;
+                break;
+            }
+        }
+        if (selected == UINT32_MAX) {
+            pthread_mutex_unlock(&swapchain->presentMutex);
+            return timeout == 0 ? VK_NOT_READY : VK_TIMEOUT;
+        }
+        swapchain->images[selected].acquired = true;
+        swapchain->images[selected].presentQueued = false;
+        swapchain->nextImageIndex = (selected + 1) % (uint32_t)swapchain->imageCount;
+        pthread_mutex_unlock(&swapchain->presentMutex);
 
+        if (signalSemaphore || fence) {
+            VkSubmitInfo submitInfo = {0};
+            submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            if (signalSemaphore) {
+                submitInfo.signalSemaphoreCount = 1;
+                submitInfo.pSignalSemaphores = &signalSemaphore;
+            }
+            VkResult result = vulkanWrapper.vkQueueSubmit(
+                swapchain->queue, 1, &submitInfo, fence);
+            if (result != VK_SUCCESS) {
+                XWindowSwapchain_releaseWaylandImage(swapchain, selected);
+                return result;
+            }
+        }
+        *imageIndex = selected;
+        return VK_SUCCESS;
+    }
+#endif
+#ifdef VORTEK_CLI_X11
     if (!XWindowSwapchain_hasWindowProvider(swapchain->jmethods)) {
         if (!swapchain->useDri3) processX11WindowEvents(swapchain);
 
@@ -2058,7 +2389,127 @@ static void stopCliPresentThread(XWindowSwapchain* swapchain) {
     MEMFREE(swapchain->presentQueue);
     swapchain->presentSyncInitialized = false;
 }
+#endif
 
+#ifdef VORTEK_WAYLAND_SHM
+static VkResult presentWaylandImage(XWindowSwapchain* swapchain,
+                                    uint32_t imageIndex,
+                                    uint32_t waitSemaphoreCount,
+                                    const VkSemaphore* waitSemaphores) {
+    if (!swapchain || !swapchain->useWaylandShm ||
+        imageIndex >= (uint32_t)swapchain->imageCount)
+        return VK_ERROR_SURFACE_LOST_KHR;
+    if (waitSemaphoreCount > 0 && !waitSemaphores)
+        return VK_ERROR_INITIALIZATION_FAILED;
+
+    pthread_mutex_lock(&swapchain->presentMutex);
+    XWindowSwapchain_Image* image = &swapchain->images[imageIndex];
+    VkResult result = swapchain->presentStatus;
+    if (result == VK_SUCCESS && (!image->acquired || image->presentQueued))
+        result = VK_NOT_READY;
+    if (result == VK_SUCCESS) image->presentQueued = true;
+    pthread_mutex_unlock(&swapchain->presentMutex);
+    if (result != VK_SUCCESS) return result;
+
+    VkCommandBuffer commandBuffer = image->commandBuffer;
+    if (!commandBuffer || !image->presentFence || !image->readbackBuffer) {
+        result = VK_ERROR_INITIALIZATION_FAILED;
+        goto error;
+    }
+
+    if (!image->presentCommandBufferReusable) {
+        result = vulkanWrapper.vkResetCommandBuffer(commandBuffer, 0);
+        if (result != VK_SUCCESS) goto error;
+        VkCommandBufferBeginInfo beginInfo = {0};
+        beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+        result = vulkanWrapper.vkBeginCommandBuffer(commandBuffer, &beginInfo);
+        if (result != VK_SUCCESS) goto error;
+
+        VkImageMemoryBarrier barrier = {0};
+        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+        barrier.srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT;
+        barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.image = image->image;
+        barrier.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        barrier.subresourceRange.levelCount = 1;
+        barrier.subresourceRange.layerCount = 1;
+        vulkanWrapper.vkCmdPipelineBarrier(
+            commandBuffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+
+        VkBufferImageCopy region = {0};
+        region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        region.imageSubresource.layerCount = 1;
+        region.imageExtent.width = swapchain->imageExtent.width;
+        region.imageExtent.height = swapchain->imageExtent.height;
+        region.imageExtent.depth = 1;
+        vulkanWrapper.vkCmdCopyImageToBuffer(
+            commandBuffer, image->image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            image->readbackBuffer, 1, &region);
+
+        barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+        barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT;
+        barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+        vulkanWrapper.vkCmdPipelineBarrier(
+            commandBuffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &barrier);
+        result = vulkanWrapper.vkEndCommandBuffer(commandBuffer);
+        if (result != VK_SUCCESS) goto error;
+        image->presentCommandBufferReusable = true;
+    }
+
+    VkPipelineStageFlags waitStages[waitSemaphoreCount > 0 ? waitSemaphoreCount : 1];
+    for (uint32_t i = 0; i < waitSemaphoreCount; i++)
+        waitStages[i] = VK_PIPELINE_STAGE_TRANSFER_BIT;
+    VkSubmitInfo submitInfo = {0};
+    submitInfo.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submitInfo.waitSemaphoreCount = waitSemaphoreCount;
+    submitInfo.pWaitSemaphores = waitSemaphores;
+    submitInfo.pWaitDstStageMask = waitSemaphoreCount ? waitStages : NULL;
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &commandBuffer;
+    result = vulkanWrapper.vkResetFences(
+        swapchain->device, 1, &image->presentFence);
+    if (result != VK_SUCCESS) goto error;
+    result = vulkanWrapper.vkQueueSubmit(
+        swapchain->queue, 1, &submitInfo, image->presentFence);
+    if (result != VK_SUCCESS) goto error;
+    result = vulkanWrapper.vkWaitForFences(
+        swapchain->device, 1, &image->presentFence, VK_TRUE, UINT64_MAX);
+    if (result != VK_SUCCESS) goto error;
+
+    VkDeviceSize imageBytes = (VkDeviceSize)swapchain->waylandShmStride *
+                              swapchain->imageExtent.height;
+    if (!(image->readbackMemoryFlags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+        VkMappedMemoryRange range = {0};
+        range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+        range.memory = image->readbackMemory;
+        range.size = imageBytes;
+        result = vulkanWrapper.vkInvalidateMappedMemoryRanges(
+            swapchain->device, 1, &range);
+        if (result != VK_SUCCESS) goto error;
+    }
+    memcpy((char*)swapchain->waylandShmData +
+               swapchain->waylandShmSliceSize * imageIndex,
+           image->readbackData, (size_t)imageBytes);
+
+    pthread_mutex_lock(&swapchain->presentMutex);
+    image->presentQueued = false;
+    pthread_mutex_unlock(&swapchain->presentMutex);
+    return VK_SUCCESS;
+
+error:
+    XWindowSwapchain_releaseWaylandImage(swapchain, imageIndex);
+    return result;
+}
+#endif
+
+#ifdef VORTEK_CLI_X11
 static VkResult presentX11Image(XWindowSwapchain* swapchain, uint32_t imageIndex,
                                 uint32_t waitSemaphoreCount, const VkSemaphore* waitSemaphores) {
     if (!swapchain->x11Display || imageIndex >= (uint32_t)swapchain->imageCount) {
@@ -2243,6 +2694,11 @@ VkResult XWindowSwapchain_presentImageWithWaits(XWindowSwapchain* swapchain, uin
                                                 uint32_t waitSemaphoreCount, const VkSemaphore* waitSemaphores) {
     if (!swapchain) return VK_ERROR_SURFACE_LOST_KHR;
     if (waitSemaphoreCount > 0 && !waitSemaphores) return VK_ERROR_INITIALIZATION_FAILED;
+#ifdef VORTEK_WAYLAND_SHM
+    if (swapchain->useWaylandShm)
+        return presentWaylandImage(swapchain, imageIndex,
+                                   waitSemaphoreCount, waitSemaphores);
+#endif
     if (XWindowSwapchain_hasWindowProvider(swapchain->jmethods)) return VK_ERROR_INITIALIZATION_FAILED;
     VkResult result = presentX11Image(swapchain, imageIndex, waitSemaphoreCount, waitSemaphores);
     if (result != VK_SUCCESS) releaseCliImage(swapchain, imageIndex);
@@ -2252,6 +2708,11 @@ VkResult XWindowSwapchain_presentImageWithWaits(XWindowSwapchain* swapchain, uin
 
 VkResult XWindowSwapchain_presentImage(XWindowSwapchain* swapchain, uint32_t imageIndex) {
     if (!swapchain) return VK_ERROR_SURFACE_LOST_KHR;
+
+#ifdef VORTEK_WAYLAND_SHM
+    if (swapchain->useWaylandShm)
+        return presentWaylandImage(swapchain, imageIndex, 0, NULL);
+#endif
 
     if (!XWindowSwapchain_hasWindowProvider(swapchain->jmethods)) {
 #ifdef VORTEK_CLI_X11

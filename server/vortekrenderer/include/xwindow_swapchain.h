@@ -8,25 +8,27 @@
 typedef struct XWindowSwapchain_Image {
     VkImage image;
     VkDeviceMemory memory;
+#if defined(VORTEK_CLI_X11) || defined(VORTEK_WAYLAND_SHM)
+    bool presentCommandBufferReusable;
+    bool acquired;
+    bool presentQueued;
+    VkCommandBuffer commandBuffer;
+    VkFence presentFence;
+    VkBuffer readbackBuffer;
+    VkDeviceMemory readbackMemory;
+    void* readbackData;
+    uint32_t readbackMemoryFlags;
+#endif
 #ifdef VORTEK_CLI_X11
     AHardwareBuffer* hardwareBuffer;
     VkImage dri3PresentImage;
     VkDeviceMemory dri3PresentMemory;
     bool dri3Blit;
     bool dri3PresentImageInitialized;
-    bool presentCommandBufferReusable;
-    bool acquired;
-    bool presentQueued;
-    VkCommandBuffer commandBuffer;
-    VkFence presentFence;
     uint32_t xcbPixmap;
     uint32_t xcbSyncFence;
     void* xcbShmFence;
     uint32_t presentSerial;
-    VkBuffer readbackBuffer;
-    VkDeviceMemory readbackMemory;
-    void* readbackData;
-    uint32_t readbackMemoryFlags;
 #endif
 } XWindowSwapchain_Image;
 
@@ -39,16 +41,27 @@ typedef struct XWindowSwapchain {
     VkImageUsageFlags imageUsage;
     VkQueue queue;
     JMethods* jmethods;
-#ifdef VORTEK_CLI_X11
+#if defined(VORTEK_CLI_X11) || defined(VORTEK_WAYLAND_SHM)
     VkDevice device;
     VkPhysicalDevice physicalDevice;
     VkCommandPool commandPool;
     uint32_t nextImageIndex;
     pthread_mutex_t presentMutex;
-    pthread_cond_t presentCond;
     pthread_cond_t imageAvailableCond;
-    pthread_t presentThread;
     bool presentSyncInitialized;
+    VkResult presentStatus;
+#endif
+#ifdef VORTEK_WAYLAND_SHM
+    bool useWaylandShm;
+    int waylandShmFd;
+    void* waylandShmData;
+    uint64_t waylandShmPoolSize;
+    uint64_t waylandShmSliceSize;
+    uint32_t waylandShmStride;
+#endif
+#ifdef VORTEK_CLI_X11
+    pthread_cond_t presentCond;
+    pthread_t presentThread;
     bool presentThreadRunning;
     bool presentThreadStop;
     bool useDri3;
@@ -63,7 +76,6 @@ typedef struct XWindowSwapchain {
     uint32_t presentSerial;
     uint32_t fifoPendingSerial;
     uint64_t nextPresentMsc;
-    VkResult presentStatus;
     void* x11Display;
     void* x11Image;
     void* x11GC;
@@ -86,6 +98,12 @@ extern bool XWindowSwapchain_hasWindowProvider(JMethods* jmethods);
 extern bool XWindowSwapchain_hasPresentationBackend(JMethods* jmethods);
 extern int getSurfaceMinImageCount();
 extern VkSurfaceFormatKHR* getSurfaceFormats(uint32_t* formatCount);
+extern bool XWindowSwapchain_isWaylandSurface(uint64_t windowId);
+extern bool XWindowSwapchain_getWaylandInfo(XWindowSwapchain* swapchain,
+                                             VortekWaylandSwapchainInfo* info,
+                                             int* fd);
+extern void XWindowSwapchain_releaseWaylandImage(XWindowSwapchain* swapchain,
+                                                  uint32_t imageIndex);
 
 extern XWindowSwapchain* XWindowSwapchain_create(VkDevice device, VkPhysicalDevice physicalDevice, uint32_t graphicsQueueIndex, VkSwapchainCreateInfoKHR* swapchainInfo, JMethods* jmethods, uint64_t windowId);
 extern void XWindowSwapchain_destroy(VkDevice device, XWindowSwapchain* swapchain);

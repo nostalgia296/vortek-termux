@@ -142,7 +142,11 @@ static bool setupRingBuffers(VkContext* context) {
     context->clientRing = RingBuffer_create(shmFds[1], CLIENT_RING_BUFFER_SIZE);
     if (!context->clientRing) goto error;
 
-    int result = send_fds(context->clientFd, shmFds, 2, NULL, 0);
+    uint8_t serverFeatures = 0;
+#ifdef VORTEK_WAYLAND_SHM
+    serverFeatures |= VORTEK_SERVER_FEATURE_WAYLAND_SHM;
+#endif
+    int result = send_fds(context->clientFd, shmFds, 2, &serverFeatures, sizeof(serverFeatures));
     CLOSEFD(shmFds[0]);
     CLOSEFD(shmFds[1]);
 

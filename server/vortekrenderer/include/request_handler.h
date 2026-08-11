@@ -6,6 +6,8 @@
 
 typedef void (*HandleRequestFunc)(VkContext* context);
 
+extern void vt_handle_waylandReleaseImage(VkContext* context);
+
 extern void vt_handle_vkCreateInstance(VkContext* context);
 extern void vt_handle_vkDestroyInstance(VkContext* context);
 extern void vt_handle_vkEnumeratePhysicalDevices(VkContext* context);

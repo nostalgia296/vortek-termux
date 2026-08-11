@@ -90,6 +90,7 @@
 #include "socket_utils.h"
 #include "ring_buffer.h"
 #include "thread_pool.h"
+#include "wayland_wsi_protocol.h"
 
 typedef struct MemoryPool {
     void* data;

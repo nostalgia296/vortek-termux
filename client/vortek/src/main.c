@@ -10,6 +10,7 @@ uint16_t maxClientRequestId = 1;
 MemoryPool globalMemoryPool = {0};
 RingBuffer* serverRing = NULL;
 RingBuffer* clientRing = NULL;
+uint8_t serverFeatures = 0;
 
 static int vortekServerConnect() {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -45,9 +46,10 @@ static bool createVkContext() {
     if (res < 0) return false;
     
     int shmFds[2];
-    int numFds;
-    recv_fds(serverFd, shmFds, &numFds, NULL, 0);
-    if (numFds != 2) return false;
+    int numFds = 0;
+    int bytesRead = recv_fds(serverFd, shmFds, &numFds, &serverFeatures,
+                             sizeof(serverFeatures));
+    if (bytesRead != sizeof(serverFeatures) || numFds != 2) return false;
     
     serverRing = RingBuffer_create(shmFds[0], SERVER_RING_BUFFER_SIZE);
     if (!serverRing) return false;

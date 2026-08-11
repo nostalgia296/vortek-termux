@@ -8,6 +8,7 @@
 #include "vk_object_pool.h"
 #include "vulkan/vk_icd.h"
 #include "vulkan/vk_layer.h"
+#include "wayland_wsi.h"
 
 #define MSG_DEBUG_UNIMPLEMENTED_VKCALL "vortek: unimplemented call %s\n"
 
@@ -238,6 +239,7 @@ VkResult vt_call_vkEnumerateInstanceLayerProperties(uint32_t* pPropertyCount, Vk
 
 VkResult vt_call_vkEnumerateInstanceExtensionProperties(const char* pLayerName, uint32_t* pPropertyCount, VkExtensionProperties* pProperties) {
     VT_CALL_LOCK();
+    uint32_t capacity = pProperties ? *pPropertyCount : 0;
     if (!pProperties) *pPropertyCount = 0;
 
     VT_SERIALIZE_CMD(vkEnumerateInstanceExtensionProperties, NULL, pPropertyCount, NULL);
@@ -245,6 +247,32 @@ VkResult vt_call_vkEnumerateInstanceExtensionProperties(const char* pLayerName, 
     VT_RECV_CHECKED(VT_RETURN);
 
     vt_unserialize_vkEnumerateInstanceExtensionProperties(NULL, pPropertyCount, pProperties, inputBuffer, &globalMemoryPool);
+#ifdef VORTEK_WAYLAND_WSI
+    if (serverFeatures & VORTEK_SERVER_FEATURE_WAYLAND_SHM) {
+        if (!pProperties) {
+            (*pPropertyCount)++;
+        }
+        else {
+            bool found = false;
+            for (uint32_t i = 0; i < *pPropertyCount; i++) {
+                if (strcmp(pProperties[i].extensionName,
+                           VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                if (*pPropertyCount < capacity) {
+                    VkExtensionProperties* property = &pProperties[(*pPropertyCount)++];
+                    memset(property, 0, sizeof(*property));
+                    strcpy(property->extensionName, VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME);
+                    property->specVersion = VK_KHR_WAYLAND_SURFACE_SPEC_VERSION;
+                }
+                else result = VK_INCOMPLETE;
+            }
+        }
+    }
+#endif
     VT_CALL_UNLOCK();
     return (VkResult)result;
 }
@@ -1823,6 +1851,7 @@ void vt_call_vkCmdExecuteCommands(VkCommandBuffer commandBuffer, uint32_t comman
 
 void vt_call_vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks* pAllocator) {
     VkObject* surfaceObject = VkObject_fromHandle(surface);
+    vt_wayland_destroy_surface(surfaceObject);
     VkObject_free(surfaceObject);
 }
 
@@ -1891,8 +1920,30 @@ VkResult vt_call_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateIn
     
     uint64_t swapchainId;
     vt_unserialize_VkSwapchainKHR((VkSwapchainKHR)&swapchainId, inputBuffer, &globalMemoryPool);
+    if (result != VK_SUCCESS || swapchainId == 0) {
+        *pSwapchain = VK_NULL_HANDLE;
+        VT_CALL_UNLOCK();
+        return (VkResult)result;
+    }
     VkObject* swapchainObject = VkObject_create(VK_OBJECT_TYPE_SWAPCHAIN_KHR, swapchainId);
     *pSwapchain = VkObject_toHandle(swapchainObject);
+
+#ifdef VORTEK_WAYLAND_WSI
+    if (vt_wayland_is_surface(surfaceObject)) {
+        VkResult waylandResult = vt_wayland_create_swapchain(
+            swapchainObject, surfaceObject, pCreateInfo);
+        if (waylandResult != VK_SUCCESS) {
+            VT_SERIALIZE_CMD(vkDestroySwapchainKHR, (VkDevice)&deviceObject->id,
+                             (VkSwapchainKHR)&swapchainObject->id, NULL);
+            vt_send(serverRing, REQUEST_CODE_VK_DESTROY_SWAPCHAIN_KHR,
+                    outputBuffer, bufferSize);
+            VkObject_free(swapchainObject);
+            *pSwapchain = VK_NULL_HANDLE;
+            VT_CALL_UNLOCK();
+            return waylandResult;
+        }
+    }
+#endif
     
     VT_CALL_UNLOCK();
     return (VkResult)result;     
@@ -1906,6 +1957,7 @@ void vt_call_vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, co
     VT_SERIALIZE_CMD(vkDestroySwapchainKHR, (VkDevice)&deviceObject->id, (VkSwapchainKHR)&swapchainObject->id, NULL);
     vt_send(serverRing, REQUEST_CODE_VK_DESTROY_SWAPCHAIN_KHR, outputBuffer, bufferSize);
 
+    vt_wayland_destroy_swapchain(swapchainObject);
     VkObject_free(swapchainObject);
     VT_CALL_UNLOCK();
 }
@@ -1931,8 +1983,15 @@ VkResult vt_call_vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain
     VkObject* swapchainObject = VkObject_fromHandle(swapchain);
     VkObject* semaphoreObject = VkObject_fromHandle(semaphore);
     VkObject* fenceObject = VkObject_fromHandle(fence);
+
+    VkResult waylandResult = vt_wayland_before_acquire(swapchainObject, timeout);
+    if (waylandResult != VK_SUCCESS) {
+        VT_CALL_UNLOCK();
+        return waylandResult;
+    }
+    uint64_t serverTimeout = vt_wayland_is_swapchain(swapchainObject) ? 0 : timeout;
  
-    VT_SERIALIZE_CMD(vkAcquireNextImageKHR, (VkDevice)&deviceObject->id, (VkSwapchainKHR)&swapchainObject->id, timeout, (VkSemaphore)&semaphoreObject->id, (VkFence)&fenceObject->id, NULL);
+    VT_SERIALIZE_CMD(vkAcquireNextImageKHR, (VkDevice)&deviceObject->id, (VkSwapchainKHR)&swapchainObject->id, serverTimeout, (VkSemaphore)&semaphoreObject->id, (VkFence)&fenceObject->id, NULL);
     VT_SEND_CHECKED(REQUEST_CODE_VK_ACQUIRE_NEXT_IMAGE_KHR, VT_RETURN);
     VT_RECV_CHECKED(VT_RETURN);
 
@@ -1940,6 +1999,9 @@ VkResult vt_call_vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain
         *pImageIndex = result;
         result = VK_SUCCESS;
     }
+    vt_wayland_after_acquire(swapchainObject,
+                             result == VK_SUCCESS ? *pImageIndex : 0,
+                             (VkResult)result);
 
     VT_CALL_UNLOCK();
     return (VkResult)result;
@@ -1947,10 +2009,18 @@ VkResult vt_call_vkAcquireNextImageKHR(VkDevice device, VkSwapchainKHR swapchain
 
 VkResult vt_call_vkQueuePresentKHR(VkQueue queue, const VkPresentInfoKHR* pPresentInfo) {
     VT_CALL_LOCK();
+
+    VkResult waylandResult = vt_wayland_before_present(pPresentInfo);
+    if (waylandResult != VK_SUCCESS) {
+        VT_CALL_UNLOCK();
+        return waylandResult;
+    }
     
     VT_SERIALIZE_CMD(VkPresentInfoKHR, pPresentInfo);
     VT_SEND_CHECKED(REQUEST_CODE_VK_QUEUE_PRESENT_KHR, VT_RETURN);
     VT_RECV_CHECKED(VT_RETURN);
+
+    result = vt_wayland_after_present(pPresentInfo, (VkResult)result);
 
     if (pPresentInfo->pResults) {
         for (int i = 0; i < pPresentInfo->swapchainCount; i++) {
@@ -2277,8 +2347,20 @@ VkResult vt_call_vkGetDeviceGroupSurfacePresentModesKHR(VkDevice device, VkSurfa
 
 VkResult vt_call_vkAcquireNextImage2KHR(VkDevice device, const VkAcquireNextImageInfoKHR* pAcquireInfo, uint32_t* pImageIndex) {
     VT_CALL_LOCK();
- 
-    VT_SERIALIZE_CMD(VkAcquireNextImageInfoKHR, pAcquireInfo);
+    if (!pAcquireInfo) {
+        VT_CALL_UNLOCK();
+        return VK_ERROR_INITIALIZATION_FAILED;
+    }
+    VkObject* swapchainObject = VkObject_fromHandle(pAcquireInfo->swapchain);
+    VkResult waylandResult = vt_wayland_before_acquire(swapchainObject, pAcquireInfo->timeout);
+    if (waylandResult != VK_SUCCESS) {
+        VT_CALL_UNLOCK();
+        return waylandResult;
+    }
+    VkAcquireNextImageInfoKHR acquireInfo = *pAcquireInfo;
+    if (vt_wayland_is_swapchain(swapchainObject)) acquireInfo.timeout = 0;
+
+    VT_SERIALIZE_CMD(VkAcquireNextImageInfoKHR, &acquireInfo);
     VT_SEND_CHECKED(REQUEST_CODE_VK_ACQUIRE_NEXT_IMAGE2_KHR, VT_RETURN);
     VT_RECV_CHECKED(VT_RETURN);
 
@@ -2286,6 +2368,9 @@ VkResult vt_call_vkAcquireNextImage2KHR(VkDevice device, const VkAcquireNextImag
         *pImageIndex = result;
         result = VK_SUCCESS;
     }
+    vt_wayland_after_acquire(swapchainObject,
+                             result == VK_SUCCESS ? *pImageIndex : 0,
+                             (VkResult)result);
 
     VT_CALL_UNLOCK();
     return (VkResult)result;
@@ -3477,6 +3562,10 @@ static const struct VulkanFunc vkDispatchTable[] = {
     {"vkCreateXcbSurfaceKHR", vt_call_vkCreateXcbSurfaceKHR},
     {"vkGetPhysicalDeviceXlibPresentationSupportKHR", vt_call_vkGetPhysicalDeviceXlibPresentationSupportKHR},
     {"vkGetPhysicalDeviceXcbPresentationSupportKHR", vt_call_vkGetPhysicalDeviceXcbPresentationSupportKHR},
+#ifdef VORTEK_WAYLAND_WSI
+    {"vkCreateWaylandSurfaceKHR", vt_call_vkCreateWaylandSurfaceKHR},
+    {"vkGetPhysicalDeviceWaylandPresentationSupportKHR", vt_call_vkGetPhysicalDeviceWaylandPresentationSupportKHR},
+#endif
     {"vkGetPhysicalDeviceFeatures2", vt_call_vkGetPhysicalDeviceFeatures2},
     {"vkGetPhysicalDeviceFeatures2KHR", vt_call_vkGetPhysicalDeviceFeatures2},
     {"vkGetPhysicalDeviceProperties2", vt_call_vkGetPhysicalDeviceProperties2},
